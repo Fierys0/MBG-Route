@@ -1,0 +1,8 @@
+build/
+LICENSE
+.cache/
+.clangd
+compile_commands.json
+build_android/
+android/app/build
+android/src/main/assets
