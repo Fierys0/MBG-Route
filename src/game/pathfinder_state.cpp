@@ -504,9 +504,10 @@ void PathfinderState::DrawDirty() {
     }
 
     // 3. Draw Delivery Truck Model (Mobil MBG)
+    // +180 degrees so truck headlights face forward in movement direction
     float truckScale = 0.022f;
     Vector3 truckRenderPos = m_carCurrentPos;
-    DrawModelEx(m_truckModel, truckRenderPos, (Vector3){0, 1, 0}, m_carHeading * RAD2DEG,
+    DrawModelEx(m_truckModel, truckRenderPos, (Vector3){0, 1, 0}, (m_carHeading * RAD2DEG) + 180.0f,
                 (Vector3){truckScale, truckScale, truckScale}, WHITE);
 
     // Halo ring under the truck in current leg color

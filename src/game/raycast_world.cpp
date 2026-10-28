@@ -1,4 +1,5 @@
 #include "raycast_world.hpp"
+#include "fumbo.hpp"
 #include "rlgl.h"
 #include <queue>
 #include <algorithm>
@@ -204,7 +205,10 @@ MapTileType RaycastWorld::ClassifyPixelColor(Color c) const {
 bool RaycastWorld::GenerateFromImage(const char* imagePath, int downscaleFactor) {
     Cleanup();
 
-    Image img = LoadImage(imagePath);
+    Image img = Fumbo::Assets::LoadImage(imagePath);
+    if (img.data == nullptr) {
+        img = ::LoadImage(imagePath);
+    }
     if (img.data == nullptr) {
         TraceLog(LOG_ERROR, "Failed to load map image: %s", imagePath);
         return false;

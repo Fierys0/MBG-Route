@@ -1,4 +1,5 @@
 build/
+build_win/
 LICENSE
 .cache/
 .clangd
