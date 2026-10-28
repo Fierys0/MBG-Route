@@ -6,6 +6,8 @@
 #include <cmath>
 #include <algorithm>
 #include <numeric>
+#include <map>
+#include <chrono>
 
 // Google Maps Leg Colors (Each school destination has its own unique vibrant route color)
 static const Color LEG_COLORS[] = {
@@ -67,7 +69,7 @@ PathfinderState::~PathfinderState() {
 }
 
 void PathfinderState::Init() {
-    TraceLog(LOG_INFO, "Initializing PathfinderState with Multi-School Optimization...");
+    TraceLog(LOG_INFO, "Initializing PathfinderState with MBG Routing Algorithm...");
 
     // 1. Generate 3D procedural world using Ray Casting against map image
     bool ok = m_world.GenerateFromImage("assets/map.jpg", 6);
@@ -93,7 +95,7 @@ void PathfinderState::Init() {
     m_camera.projection = CAMERA_PERSPECTIVE;
     m_camMode = APP_CAM_FOLLOW_CAR;
 
-    // 4. Randomize initial positions & optimize multi-school route
+    // 4. Randomize initial positions & solve MBG multi-school routing
     RandomizePositions();
 
     m_isDriving = true;
@@ -126,17 +128,18 @@ void PathfinderState::UnloadRouteModels() {
 
 // =============================================================================
 // Pick multiple school destinations on the connected road network
-// and find the optimal sequence that minimizes total travel distance (TSP)
+// and initialize SPPG (Dapur Pusat) and schools with Time Windows
 // =============================================================================
 void PathfinderState::RandomizePositions() {
+    // 1. Pick SPPG (Satuan Pelayanan Pemenuhan Gizi / Central Kitchen) location
     m_carStartGridPos = m_world.GetRandomRoadPosition();
     m_carCurrentPos = m_world.GridToWorld(m_carStartGridPos.x, m_carStartGridPos.y, 0.05f);
 
-    // Ensure m_numSchools is at least 3
+    // Clamp school count to [3, MAX_SCHOOLS]
     if (m_numSchools < 3) m_numSchools = 3;
-    if (m_numSchools > 6) m_numSchools = 6;
+    if (m_numSchools > MAX_SCHOOLS) m_numSchools = MAX_SCHOOLS;
 
-    // Pick distinct schools on connected roads with good spatial distribution
+    // 2. Pick distinct schools on connected roads with good spatial distribution
     std::vector<Vector2> pickedSchoolGridCoords;
     int attempts = 0;
 
@@ -145,11 +148,11 @@ void PathfinderState::RandomizePositions() {
         Vector2 cand = m_world.GetRandomRoadPosition();
 
         if (!m_world.AreConnected(m_carStartGridPos, cand)) continue;
-        if (Vector2Distance(m_carStartGridPos, cand) < 30.0f) continue;
+        if (Vector2Distance(m_carStartGridPos, cand) < 28.0f) continue;
 
         bool tooCloseToOther = false;
         for (const auto& existing : pickedSchoolGridCoords) {
-            if (Vector2Distance(existing, cand) < 28.0f) {
+            if (Vector2Distance(existing, cand) < 26.0f) {
                 tooCloseToOther = true;
                 break;
             }
@@ -167,62 +170,38 @@ void PathfinderState::RandomizePositions() {
         }
     }
 
-    // =========================================================================
-    // Multi-Destination Route Optimization (Traveling Salesperson Sequence):
-    // Evaluates visiting order permutations to find the minimal total travel distance!
-    // Mobil -> Sekolah A -> Sekolah B -> Sekolah C
-    // =========================================================================
-    int n = (int)pickedSchoolGridCoords.size();
-    std::vector<int> perm(n);
-    std::iota(perm.begin(), perm.end(), 0);
-
-    std::vector<int> bestPerm = perm;
-    float bestTotalDist = 1e9f;
-
-    // Fast Octile distance metric for permutation optimization
-    auto EstimateDist = [&](Vector2 a, Vector2 b) -> float {
-        float dx = fabsf(a.x - b.x);
-        float dy = fabsf(a.y - b.y);
-        return (dx + dy) + (1.41421356f - 2.0f) * fminf(dx, dy);
-    };
-
-    do {
-        float cost = EstimateDist(m_carStartGridPos, pickedSchoolGridCoords[perm[0]]);
-        for (int i = 0; i < n - 1; i++) {
-            cost += EstimateDist(pickedSchoolGridCoords[perm[i]], pickedSchoolGridCoords[perm[i + 1]]);
-        }
-        if (cost < bestTotalDist) {
-            bestTotalDist = cost;
-            bestPerm = perm;
-        }
-    } while (std::next_permutation(perm.begin(), perm.end()));
-
-    // Assemble the ordered schools list based on the optimal sequence
+    // 3. Assemble schools with realistic delivery Time Windows and unload times
     m_schools.clear();
-    m_optimizationLog = "Urutan Optimal: Mobil";
-
-    for (int i = 0; i < n; i++) {
-        int originalIdx = bestPerm[i];
-        Vector2 gPos = pickedSchoolGridCoords[originalIdx];
+    for (int i = 0; i < (int)pickedSchoolGridCoords.size(); i++) {
+        Vector2 gPos = pickedSchoolGridCoords[i];
 
         SchoolDestination sch;
         sch.id = i + 1;
-        sch.name = TextFormat("Sekolah %d", sch.id);
+        sch.name = TextFormat("SDN 0%d", i + 1);
         sch.gridPos = gPos;
         sch.worldPos = m_world.GridToWorld(gPos.x, gPos.y, 0.0f);
-        sch.color = LEG_COLORS[i % 6];
-        sch.darkColor = LEG_DARK_COLORS[i % 6];
-        sch.reached = false;
+
+        // Realistic delivery time windows in minutes:
+        // Lunch delivery window between 10:00 - 12:30 (simulated in minutes)
+        float estDist = Vector2Distance(m_carStartGridPos, gPos);
+        int baseMins = std::max(15, (int)(estDist * 0.45f));
+        sch.window.start = std::max(10, baseMins - 10);
+        sch.window.end   = baseMins + 75 + i * 25; // Achievable window
+        sch.unloadTime   = 5; // 5 menit bongkar muatan makanan bergizi
+        sch.color        = LEG_COLORS[i % 6];
+        sch.darkColor    = LEG_DARK_COLORS[i % 6];
+        sch.reached      = false;
 
         m_schools.push_back(sch);
-        m_optimizationLog += TextFormat(" ➔ [%d] Sek. %d (%s)", i + 1, sch.id, LEG_COLOR_NAMES[i % 6]);
     }
 
-    // Build the routes and 3D colored ribbon meshes for each leg
+    // 4. Run MBG Routing Algorithm (Graph + Dijkstra + DP Modified / Baseline)
     OptimizeAndBuildRoutes();
 
     m_isDriving = true;
     m_allDelivered = false;
+    m_isUnloading = false;
+    m_unloadTimer = 0.0f;
     m_arrivalTimer = 0.0f;
     m_currentLegIndex = 0;
     m_legDriveProgress = 0.0f;
@@ -238,7 +217,8 @@ void PathfinderState::RandomizePositions() {
 }
 
 // =============================================================================
-// Build each leg of the multi-school journey with its own distinct color ribbon
+// Optimize routes using the MBG Routing Algorithm from `mbg_routing`
+// Uses Graph, Dijkstra, and DPModified / DPBaseline (TSPTW with Food Freshness)
 // =============================================================================
 void PathfinderState::OptimizeAndBuildRoutes() {
     UnloadRouteModels();
@@ -247,18 +227,132 @@ void PathfinderState::OptimizeAndBuildRoutes() {
     m_totalNodesExplored = 0;
     m_totalExecutionTimeMs = 0.0;
 
-    Vector2 currentStart = m_carStartGridPos;
+    int n = (int)m_schools.size();
+    if (n == 0) return;
 
+    // Build list of all locations:
+    // Location 0 = SPPG (Dapur Pusat / Car Start)
+    // Locations 1..n = Schools
+    struct LocInfo {
+        int id; // 0 for SPPG, 1..n for schools
+        Vector2 gridPos;
+    };
+
+    std::vector<LocInfo> locations;
+    locations.push_back({0, m_carStartGridPos});
+    for (int i = 0; i < n; i++) {
+        locations.push_back({m_schools[i].id, m_schools[i].gridPos});
+    }
+
+    int totalLocs = (int)locations.size();
+
+    // Cache computed road paths and edge weights for Graph g
+    std::map<std::pair<int, int>, PathResult> pathCache;
+    Graph g;
+
+    for (int i = 0; i < totalLocs; i++) {
+        for (int j = i + 1; j < totalLocs; j++) {
+            PathResult p = m_pathfinder.FindShortestPath(m_world, locations[i].gridPos, locations[j].gridPos, m_gridPathAlgo);
+            pathCache[{locations[i].id, locations[j].id}] = p;
+
+            // Travel time in simulation minutes: 1 world distance unit ~ 0.4 minute
+            int weight = std::max(1, (int)roundf(p.totalDistanceWorld * 0.40f));
+            g.addEdge(locations[i].id, locations[j].id, weight, false);
+        }
+    }
+
+    // Convert m_schools to mbg_routing's School structs
+    std::vector<School> routingSchools;
+    for (int i = 0; i < n; i++) {
+        School s;
+        s.id = m_schools[i].id;
+        s.name = m_schools[i].name;
+        s.window = m_schools[i].window;
+        s.unload_time = m_schools[i].unloadTime;
+        routingSchools.push_back(s);
+    }
+
+    // Execute the selected MBG routing algorithm from mbg_routing!
+    auto t0 = std::chrono::high_resolution_clock::now();
+    std::vector<int> optimalRoute;
+
+    if (m_routingAlgorithm == ROUTING_DP_MODIFIED) {
+        DPModifiedResult res = dpModified(g, 0, routingSchools, m_cookTime);
+        auto t1 = std::chrono::high_resolution_clock::now();
+        m_optimizationTimeUs = std::chrono::duration<double, std::micro>(t1 - t0).count();
+
+        m_routeFeasible = res.feasible;
+        m_totalCostMinutes = res.total_cost;
+        m_statesExplored = res.states_explored;
+        optimalRoute = res.route;
+    } else {
+        DPResult res = dpBaseline(g, 0, routingSchools, m_cookTime);
+        auto t1 = std::chrono::high_resolution_clock::now();
+        m_optimizationTimeUs = std::chrono::duration<double, std::micro>(t1 - t0).count();
+
+        m_routeFeasible = res.feasible;
+        m_totalCostMinutes = res.total_cost;
+        m_statesExplored = (1 << n) * MAX_TIME; // Theoretical state space
+        optimalRoute = res.route;
+    }
+
+    // Fallback if algorithm returned empty route (e.g. strict window violation)
+    if (optimalRoute.empty()) {
+        m_routeFeasible = false;
+        for (int i = 0; i < n; i++) {
+            optimalRoute.push_back(m_schools[i].id);
+        }
+    }
+
+    m_optimalSequence = optimalRoute;
+
+    // Reorder m_schools according to optimalSequence
+    std::vector<SchoolDestination> orderedSchools;
+    for (int schoolId : optimalRoute) {
+        for (const auto& sch : m_schools) {
+            if (sch.id == schoolId) {
+                orderedSchools.push_back(sch);
+                break;
+            }
+        }
+    }
+    m_schools = orderedSchools;
+
+    // Update colors and build optimization log
+    m_optimizationLog = "MBG: SPPG (Dapur)";
     for (size_t i = 0; i < m_schools.size(); i++) {
-        Vector2 goal = m_schools[i].gridPos;
+        m_schools[i].color = LEG_COLORS[i % 6];
+        m_schools[i].darkColor = LEG_DARK_COLORS[i % 6];
+        m_schools[i].reached = false;
+        m_optimizationLog += TextFormat(" ➔ [%d] %s (%s)", (int)i + 1, m_schools[i].name.c_str(), LEG_COLOR_NAMES[i % 6]);
+    }
+
+    // Build the routes and 3D colored ribbon meshes for each leg
+    int prevId = 0; // SPPG
+    for (size_t i = 0; i < m_schools.size(); i++) {
+        int curId = m_schools[i].id;
 
         RouteLeg leg;
         leg.legIndex = (int)i;
         leg.targetSchoolIndex = (int)i;
+        leg.destinationName = m_schools[i].name;
         leg.color = m_schools[i].color;
+        leg.isReturnToDepot = false;
 
-        // Compute shortest path for this leg using selected algorithm
-        leg.path = m_pathfinder.FindShortestPath(m_world, currentStart, goal, m_algorithm);
+        // Retrieve road path from cache or compute
+        std::pair<int, int> key1 = {prevId, curId};
+        std::pair<int, int> key2 = {curId, prevId};
+
+        if (pathCache.count(key1)) {
+            leg.path = pathCache[key1];
+        } else if (pathCache.count(key2)) {
+            leg.path = pathCache[key2];
+            std::reverse(leg.path.gridPath.begin(), leg.path.gridPath.end());
+            std::reverse(leg.path.worldWaypoints.begin(), leg.path.worldWaypoints.end());
+        } else {
+            Vector2 startPos = (prevId == 0) ? m_carStartGridPos : m_schools[i - 1].gridPos;
+            leg.path = m_pathfinder.FindShortestPath(m_world, startPos, m_schools[i].gridPos, m_gridPathAlgo);
+        }
 
         m_totalRouteDistance += leg.path.totalDistanceWorld;
         m_totalNodesExplored += leg.path.nodesExplored;
@@ -273,7 +367,47 @@ void PathfinderState::OptimizeAndBuildRoutes() {
         }
 
         m_routeLegs.push_back(leg);
-        currentStart = goal; // Next leg starts from this school
+        prevId = curId;
+    }
+
+    // =========================================================================
+    // FINAL STEP: Mobil kembali ke titik awal (SPPG / Dapur Pusat)!
+    // Setelah semua sekolah dikunjungi, truk kembali ke pangkalan
+    // =========================================================================
+    if (!m_schools.empty()) {
+        int lastSchoolId = m_schools.back().id;
+        RouteLeg returnLeg;
+        returnLeg.legIndex = (int)m_schools.size();
+        returnLeg.targetSchoolIndex = -1;
+        returnLeg.destinationName = "SPPG (Dapur Pusat)";
+        returnLeg.color = (Color){255, 185, 0, 255}; // Vibrant Amber/Gold matching SPPG
+        returnLeg.isReturnToDepot = true;
+
+        std::pair<int, int> key1 = {lastSchoolId, 0};
+        std::pair<int, int> key2 = {0, lastSchoolId};
+
+        if (pathCache.count(key1)) {
+            returnLeg.path = pathCache[key1];
+        } else if (pathCache.count(key2)) {
+            returnLeg.path = pathCache[key2];
+            std::reverse(returnLeg.path.gridPath.begin(), returnLeg.path.gridPath.end());
+            std::reverse(returnLeg.path.worldWaypoints.begin(), returnLeg.path.worldWaypoints.end());
+        } else {
+            returnLeg.path = m_pathfinder.FindShortestPath(m_world, m_schools.back().gridPos, m_carStartGridPos, m_gridPathAlgo);
+        }
+
+        m_totalRouteDistance += returnLeg.path.totalDistanceWorld;
+        m_totalNodesExplored += returnLeg.path.nodesExplored;
+        m_totalExecutionTimeMs += returnLeg.path.executionTimeMs;
+
+        if (returnLeg.path.found && returnLeg.path.gridPath.size() >= 2) {
+            returnLeg.borderModel = m_pathfinder.BuildPathMeshModel(m_world, returnLeg.path.gridPath, 0.70f, 0.08f);
+            returnLeg.pathModel = m_pathfinder.BuildPathMeshModel(m_world, returnLeg.path.gridPath, 0.48f, 0.14f);
+            returnLeg.modelsLoaded = true;
+        }
+
+        m_routeLegs.push_back(returnLeg);
+        m_optimizationLog += " ➔ [Akhir] SPPG (Kembali ke Titik Awal)";
     }
 
     UpdateNavigationStatus();
@@ -284,6 +418,11 @@ void PathfinderState::UpdateNavigationStatus() {
         m_turnInstruction = "Selesai!";
         m_distanceToCurrentTarget = 0.0f;
         m_totalDistanceRemaining = 0.0f;
+        return;
+    }
+
+    if (m_isUnloading) {
+        m_turnInstruction = TextFormat("Bongkar Muatan MBG (%s)", m_schools[m_currentLegIndex].name.c_str());
         return;
     }
 
@@ -319,20 +458,50 @@ void PathfinderState::UpdateNavigationStatus() {
         Vector3 v2 = Vector3Subtract(curLeg.path.worldWaypoints[lookAhead + 1], curLeg.path.worldWaypoints[lookAhead]);
 
         float cross = v1.x * v2.z - v1.z * v2.x;
-        if (cross > 0.12f) {
-            m_turnInstruction = "Belok Kanan";
-        } else if (cross < -0.12f) {
-            m_turnInstruction = "Belok Kiri";
+        if (curLeg.isReturnToDepot) {
+            if (cross > 0.12f) m_turnInstruction = "Belok Kanan (Kembali ke SPPG)";
+            else if (cross < -0.12f) m_turnInstruction = "Belok Kiri (Kembali ke SPPG)";
+            else m_turnInstruction = "Lurus Terus (Kembali ke SPPG)";
         } else {
-            m_turnInstruction = "Lurus Terus";
+            if (cross > 0.12f) m_turnInstruction = "Belok Kanan";
+            else if (cross < -0.12f) m_turnInstruction = "Belok Kiri";
+            else m_turnInstruction = "Lurus Terus";
         }
     } else {
-        m_turnInstruction = TextFormat("Mendekati Sekolah %d", m_currentLegIndex + 1);
+        if (curLeg.isReturnToDepot) {
+            m_turnInstruction = "Mendekati Titik Awal SPPG";
+        } else {
+            m_turnInstruction = TextFormat("Mendekati %s", curLeg.destinationName.c_str());
+        }
     }
 }
 
 void PathfinderState::UpdateCarDriving(float dt) {
     if (!m_isDriving || m_routeLegs.empty() || m_currentLegIndex >= (int)m_routeLegs.size()) {
+        return;
+    }
+
+    // Handle unloading simulation at school
+    if (m_isUnloading) {
+        m_unloadTimer -= dt;
+        if (m_unloadTimer <= 0.0f) {
+            m_isUnloading = false;
+            // Transition to next leg (could be next school OR return to SPPG!)
+            if (m_currentLegIndex + 1 < (int)m_routeLegs.size()) {
+                m_currentLegIndex++;
+                m_legDriveProgress = 0.0f;
+                if (m_routeLegs[m_currentLegIndex].isReturnToDepot) {
+                    TraceLog(LOG_INFO, "Semua sekolah selesai! Mobil sedang kembali ke titik awal (SPPG)...");
+                } else {
+                    TraceLog(LOG_INFO, "Unloading done! Now driving to School %d...", m_currentLegIndex + 1);
+                }
+            } else {
+                m_allDelivered = true;
+                m_distanceToCurrentTarget = 0.0f;
+                m_totalDistanceRemaining = 0.0f;
+            }
+        }
+        UpdateNavigationStatus();
         return;
     }
 
@@ -342,29 +511,33 @@ void PathfinderState::UpdateCarDriving(float dt) {
     int curIdx = (int)m_legDriveProgress;
     int nextIdx = curIdx + 1;
 
-    // Check if car reached current school destination
+    // Check if car reached current destination
     if (nextIdx >= (int)curLeg.path.worldWaypoints.size()) {
         m_carCurrentPos = curLeg.path.worldWaypoints.back();
-        m_schools[m_currentLegIndex].reached = true;
 
-        // Transition to next school leg!
-        if (m_currentLegIndex + 1 < (int)m_routeLegs.size()) {
-            m_currentLegIndex++;
-            m_legDriveProgress = 0.0f;
-            TraceLog(LOG_INFO, "Reached School %d! Now driving to School %d...",
-                     m_currentLegIndex, m_currentLegIndex + 1);
-        } else {
-            // Reached ALL schools! Mission accomplished!
+        if (curLeg.isReturnToDepot) {
+            // ARRIVED BACK AT STARTING POINT (SPPG)!
             m_allDelivered = true;
             m_distanceToCurrentTarget = 0.0f;
             m_totalDistanceRemaining = 0.0f;
-
             m_arrivalTimer += dt;
             if (m_arrivalTimer >= 4.0f) {
                 RandomizePositions(); // Automatically starts next delivery mission!
             }
+            UpdateNavigationStatus();
             return;
         }
+
+        // Reached a school destination: mark reached & start meal unloading
+        if (curLeg.targetSchoolIndex >= 0 && curLeg.targetSchoolIndex < (int)m_schools.size()) {
+            m_schools[curLeg.targetSchoolIndex].reached = true;
+        }
+
+        m_isUnloading = true;
+        m_unloadTimer = 1.5f;
+
+        UpdateNavigationStatus();
+        return;
     }
 
     Vector3 pA = curLeg.path.worldWaypoints[curIdx];
@@ -426,7 +599,8 @@ void PathfinderState::Update() {
 
     // Hotkeys
     if (IsKeyPressed(KEY_TAB)) {
-        m_algorithm = (m_algorithm == ALGO_ASTAR) ? ALGO_DIJKSTRA : ALGO_ASTAR;
+        // Toggle MBG Routing Algorithm between DP Modified and DP Baseline
+        m_routingAlgorithm = (m_routingAlgorithm == ROUTING_DP_MODIFIED) ? ROUTING_DP_BASELINE : ROUTING_DP_MODIFIED;
         OptimizeAndBuildRoutes();
     }
     if (IsKeyPressed(KEY_R)) {
@@ -444,9 +618,9 @@ void PathfinderState::Update() {
     if (IsKeyPressed(KEY_L)) m_showLidar = !m_showLidar;
     if (IsKeyPressed(KEY_M)) m_showMinimap = !m_showMinimap;
 
-    // Adjust school count via keyboard '+' and '-'
+    // Adjust school count via keyboard '+' and '-' (3 to 5)
     if (IsKeyPressed(KEY_EQUAL) || IsKeyPressed(KEY_KP_ADD)) {
-        if (m_numSchools < 6) {
+        if (m_numSchools < MAX_SCHOOLS) {
             m_numSchools++;
             RandomizePositions();
         }
@@ -458,14 +632,15 @@ void PathfinderState::Update() {
         }
     }
 
-    // Auto-drive car along current route leg
+    // Vehicle Driving & Navigation Status
     UpdateCarDriving(dt);
 
-    // Update active 3D LIDAR sensor rays cast from vehicle
+    // Cast LIDAR rays around vehicle
     if (m_showLidar) {
-        m_lidarHits = m_world.CastLidarRays(m_carCurrentPos, m_carHeading, 16, 18.0f);
+        m_lidarHits = m_world.CastLidarRays(m_carCurrentPos, m_carHeading, 24, 25.0f);
     }
 
+    // Camera follow controls
     UpdateCameraControls();
 }
 
@@ -503,7 +678,14 @@ void PathfinderState::DrawDirty() {
         DrawModel(leg.pathModel, {0, 0, 0}, 1.0f, ribbonCol);
     }
 
-    // 3. Draw Delivery Truck Model (Mobil MBG)
+    // 3. Draw SPPG (Dapur Pusat / Kitchen) 3D Marker Pin
+    Vector3 sppgWorld = m_world.GridToWorld(m_carStartGridPos.x, m_carStartGridPos.y, 0.0f);
+    DrawCircle3D(Vector3Add(sppgWorld, (Vector3){0, 0.06f, 0}), 2.2f, (Vector3){1, 0, 0}, 90.0f, Fade((Color){255, 190, 0, 255}, 0.5f));
+    DrawCylinder(Vector3Add(sppgWorld, (Vector3){0, 1.0f, 0}), 0.2f, 0.2f, 2.0f, 12, (Color){240, 160, 0, 255});
+    DrawSphere(Vector3Add(sppgWorld, (Vector3){0, 3.2f, 0}), 0.85f, (Color){255, 190, 0, 255});
+    DrawSphere(Vector3Add(sppgWorld, (Vector3){0, 3.2f, 0}), 0.40f, WHITE);
+
+    // 4. Draw Delivery Truck Model (Mobil MBG)
     // +180 degrees so truck headlights face forward in movement direction
     float truckScale = 0.022f;
     Vector3 truckRenderPos = m_carCurrentPos;
@@ -517,7 +699,7 @@ void PathfinderState::DrawDirty() {
     DrawCircle3D(Vector3Add(truckRenderPos, (Vector3){0, 0.08f, 0}), pulseRadius, (Vector3){1, 0, 0}, 90.0f, Fade(currentHaloColor, 0.45f));
     DrawCircle3D(Vector3Add(truckRenderPos, (Vector3){0, 0.09f, 0}), 0.18f, (Vector3){1, 0, 0}, 90.0f, currentHaloColor);
 
-    // 4. Draw School Models & Pin Markers for ALL schools (1, 2, 3...)
+    // 5. Draw School Models & Pin Markers for ALL schools (1, 2, 3...)
     float schoolScale = 0.0028f;
     for (size_t i = 0; i < m_schools.size(); i++) {
         const auto& sch = m_schools[i];
@@ -545,7 +727,7 @@ void PathfinderState::DrawDirty() {
         DrawCircle3D(Vector3Add(schRenderPos, (Vector3){0, 0.05f, 0}), ringRadius, (Vector3){1, 0, 0}, 90.0f, Fade(pinCol, 0.35f));
     }
 
-    // 5. Draw 3D LIDAR sensor rays cast from vehicle
+    // 6. Draw 3D LIDAR sensor rays cast from vehicle
     if (m_showLidar) {
         Vector3 sensorOrigin = Vector3Add(m_carCurrentPos, (Vector3){0, 0.4f, 0});
         for (const auto& hit : m_lidarHits) {
@@ -570,83 +752,110 @@ void PathfinderState::DrawUI() {
 
     // =========================================================================
     // 1. Google Maps Navigation Header (Turn-by-Turn Card)
-    // Dynamic color matching the current target school!
+    // Dynamic color matching the current target school or return leg!
     // =========================================================================
     int navCardX = 16;
     int navCardY = 14;
-    int navCardW = 410;
-    int navCardH = m_allDelivered ? 96 : 112;
+    int navCardW = 420;
+    int navCardH = m_allDelivered ? 96 : 116;
+
+    bool isReturningToDepot = (!m_routeLegs.empty() && m_currentLegIndex < (int)m_routeLegs.size() && m_routeLegs[m_currentLegIndex].isReturnToDepot);
 
     Color curHeaderBg = m_allDelivered ? (Color){24, 134, 75, 250} :
-                        (!m_routeLegs.empty() && m_currentLegIndex < (int)m_routeLegs.size()) ?
-                        Fade(m_routeLegs[m_currentLegIndex].color, 0.94f) : (Color){15, 157, 88, 250};
+                        (m_isUnloading ? (Color){210, 120, 10, 250} :
+                        (isReturningToDepot ? (Color){220, 155, 0, 250} :
+                        ((!m_routeLegs.empty() && m_currentLegIndex < (int)m_routeLegs.size()) ?
+                         Fade(m_routeLegs[m_currentLegIndex].color, 0.96f) : (Color){26, 115, 232, 250})));
 
-    DrawRectangleRounded((Rectangle){(float)navCardX, (float)navCardY, (float)navCardW, (float)navCardH}, 0.16f, 6, curHeaderBg);
-    DrawRectangleRoundedLinesEx((Rectangle){(float)navCardX, (float)navCardY, (float)navCardW, (float)navCardH}, 0.16f, 6, 2.0f, Fade(WHITE, 0.7f));
+    DrawRectangleRounded((Rectangle){(float)navCardX, (float)navCardY, (float)navCardW, (float)navCardH}, 0.12f, 6, curHeaderBg);
+    DrawRectangleRoundedLinesEx((Rectangle){(float)navCardX, (float)navCardY, (float)navCardW, (float)navCardH}, 0.12f, 6, 2.0f, Fade(WHITE, 0.45f));
 
     if (m_allDelivered) {
-        DrawText("🎉", navCardX + 18, navCardY + 24, 38, WHITE);
-        DrawText("Semua Sekolah Terkirim!", navCardX + 68, navCardY + 18, 22, WHITE);
-        DrawText(TextFormat("Sukses mengantarkan ke %d sekolah! Rute selesai.", (int)m_schools.size()),
-                 navCardX + 68, navCardY + 46, 14, (Color){220, 255, 230, 255});
-        DrawText(TextFormat("Mengacak misi baru dalam %.1f dtk...", fmaxf(0.0f, 4.0f - m_arrivalTimer)),
-                 navCardX + 68, navCardY + 68, 13, YELLOW);
-    } else {
-        const char* iconStr = "⬆";
-        if (m_turnInstruction == "Belok Kanan") iconStr = "⮞";
-        else if (m_turnInstruction == "Belok Kiri") iconStr = "⮜";
+        DrawText("✓ MISI MBG SELESAI!", navCardX + 22, navCardY + 20, 22, WHITE);
+        DrawText(TextFormat("Seluruh %d sekolah terlayani & mobil kembali ke titik awal (SPPG)!", (int)m_schools.size()),
+                 navCardX + 22, navCardY + 50, 13, (Color){220, 255, 230, 255});
+        DrawText("Memulai misi baru dalam 4 detik...", navCardX + 22, navCardY + 70, 12, (Color){200, 240, 210, 255});
+    } else if (isReturningToDepot) {
+        // Return to depot header
+        DrawText("⌂", navCardX + 22, navCardY + 24, 30, WHITE);
+        DrawText(m_turnInstruction.c_str(), navCardX + 74, navCardY + 12, 19, WHITE);
+        DrawText("Langkah Akhir: Kembali ke Titik Awal (SPPG)", navCardX + 74, navCardY + 38, 14, WHITE);
 
-        DrawRectangleRounded((Rectangle){(float)navCardX + 14, (float)navCardY + 16, 52, 52}, 0.25f, 4, Fade(BLACK, 0.25f));
-        DrawText(iconStr, navCardX + 26, navCardY + 24, 32, WHITE);
+        float metersCurrent = m_distanceToCurrentTarget * 4.0f;
+        int etaSeconds = (int)(m_distanceToCurrentTarget / m_driveSpeed);
+        DrawText(TextFormat("Sisa Jarak ke SPPG: %.0f m (%d dtk) • Menuju Pangkalan", metersCurrent, etaSeconds),
+                 navCardX + 74, navCardY + 62, 13, (Color){255, 255, 180, 255});
+        DrawText("✓ Pengiriman makanan bergizi di seluruh sekolah telah selesai",
+                 navCardX + 74, navCardY + 82, 12, (Color){255, 245, 220, 255});
+
+        DrawCircle(navCardX + navCardW - 20, navCardY + 20, 6, (Color){255, 230, 0, 255});
+        DrawText("KEMBALI", navCardX + navCardW - 74, navCardY + 16, 9, BLACK);
+    } else {
+        // Navigation icon
+        const char* iconStr = "↑";
+        if (m_turnInstruction == "Belok Kanan") iconStr = "↱";
+        else if (m_turnInstruction == "Belok Kiri") iconStr = "↰";
+        else if (m_isUnloading) iconStr = "🍱";
+        DrawText(iconStr, navCardX + 22, navCardY + 24, 30, WHITE);
 
         // Turn instruction
-        DrawText(m_turnInstruction.c_str(), navCardX + 78, navCardY + 14, 21, WHITE);
+        DrawText(m_turnInstruction.c_str(), navCardX + 74, navCardY + 12, 20, WHITE);
 
         // Destination with school step indicator
         int targetId = m_currentLegIndex + 1;
         const char* colName = (m_currentLegIndex < 6) ? LEG_COLOR_NAMES[m_currentLegIndex] : "Warna";
-        DrawText(TextFormat("Menuju: Sekolah %d dari %d (Jalur %s)", targetId, (int)m_schools.size(), colName),
-                 navCardX + 78, navCardY + 40, 15, WHITE);
+        const char* schName = (m_currentLegIndex < (int)m_schools.size()) ? m_schools[m_currentLegIndex].name.c_str() : "Sekolah";
+
+        DrawText(TextFormat("Tujuan: %s (Stop %d dari %d • Jalur %s)", schName, targetId, (int)m_schools.size(), colName),
+                 navCardX + 74, navCardY + 38, 14, WHITE);
 
         // Distance & ETA
         float metersCurrent = m_distanceToCurrentTarget * 4.0f;
         float metersTotal   = m_totalDistanceRemaining * 4.0f;
         int etaSeconds = (int)(m_distanceToCurrentTarget / m_driveSpeed);
 
-        DrawText(TextFormat("Target Ini: %.0f m (%d dtk) • Total Sisa: %.0f m", metersCurrent, etaSeconds, metersTotal),
-                 navCardX + 78, navCardY + 68, 13, (Color){255, 255, 180, 255});
+        DrawText(TextFormat("Target: %.0f m (%d dtk) • Total Sisa: %.0f m", metersCurrent, etaSeconds, metersTotal),
+                 navCardX + 74, navCardY + 62, 13, (Color){255, 255, 180, 255});
 
-        // Pulsing AUTO status
-        DrawCircle(navCardX + navCardW - 22, navCardY + 22, 6, RED);
-        DrawText("AUTO", navCardX + navCardW - 58, navCardY + 17, 10, WHITE);
+        // Time window indicator
+        if (m_currentLegIndex < (int)m_schools.size()) {
+            const auto& w = m_schools[m_currentLegIndex].window;
+            DrawText(TextFormat("Window Pengantaran: [%d - %d menit] • Bongkar: 5m", w.start, w.end),
+                     navCardX + 74, navCardY + 82, 12, (Color){230, 245, 255, 255});
+        }
+
+        // Pulsing status
+        DrawCircle(navCardX + navCardW - 20, navCardY + 20, 6, m_isUnloading ? ORANGE : RED);
+        DrawText(m_isUnloading ? "BONGKAR" : "AUTO", navCardX + navCardW - 68, navCardY + 16, 9, WHITE);
     }
 
     // =========================================================================
     // 2. Control Toolbar (Top Right / Middle)
     // =========================================================================
-    int toolX = navCardX + navCardW + 16;
+    int toolX = navCardX + navCardW + 14;
     int toolY = 14;
 
-    StateButton btnAStar     = {{(float)toolX, (float)toolY, 115, 38}, "A* Algo", m_algorithm == ALGO_ASTAR};
-    StateButton btnDijkstra  = {{(float)toolX + 125, (float)toolY, 125, 38}, "Dijkstra", m_algorithm == ALGO_DIJKSTRA};
-    StateButton btnRandomize = {{(float)toolX + 260, (float)toolY, 125, 38}, "Acak Rute [R]", false};
-    StateButton btnDrive     = {{(float)toolX + 395, (float)toolY, 120, 38}, m_isDriving ? "Jeda [SPACE]" : "Auto Jalan", m_isDriving};
+    bool isModified = (m_routingAlgorithm == ROUTING_DP_MODIFIED);
+    StateButton btnMod      = {{(float)toolX, (float)toolY, 145, 38}, "DP Modified [TAB]", isModified};
+    StateButton btnBaseAlgo = {{(float)toolX + 152, (float)toolY, 140, 38}, "DP Baseline", !isModified};
+    StateButton btnRandomize= {{(float)toolX + 298, (float)toolY, 120, 38}, "Acak Rute [R]", false};
+    StateButton btnDrive    = {{(float)toolX + 424, (float)toolY, 115, 38}, m_isDriving ? "Jeda [SPACE]" : "Auto Jalan", m_isDriving};
 
-    // Buttons to adjust number of schools live!
-    StateButton btnMinusSchool = {{(float)toolX + 525, (float)toolY, 40, 38}, "[-]", false};
-    StateButton btnSchoolCount = {{(float)toolX + 570, (float)toolY, 100, 38}, TextFormat("%d Sekolah", m_numSchools), true};
-    StateButton btnPlusSchool  = {{(float)toolX + 675, (float)toolY, 40, 38}, "[+]", false};
+    // Buttons to adjust number of schools live! (3 to 5)
+    StateButton btnMinusSchool = {{(float)toolX + 545, (float)toolY, 36, 38}, "[-]", false};
+    StateButton btnSchoolCount = {{(float)toolX + 586, (float)toolY, 90, 38}, TextFormat("%d Sekolah", m_numSchools), true};
+    StateButton btnPlusSchool  = {{(float)toolX + 681, (float)toolY, 36, 38}, "[+]", false};
 
-    StateButton btnCam = {{(float)toolX + 725, (float)toolY, 120, 38},
-                          (m_camMode == APP_CAM_FOLLOW_CAR) ? "Cam: Truk" : "Cam: Sekolah",
+    StateButton btnCam = {{(float)toolX + 724, (float)toolY, 115, 38},
+                          (m_camMode == APP_CAM_FOLLOW_CAR) ? "Cam: Truk [C]" : "Cam: Sek [S]",
                           m_camMode == APP_CAM_FOLLOW_CAR};
 
     Color btnBase = {240, 244, 250, 255};
     Color btnHover = {215, 230, 250, 255};
 
-    btnAStar.Draw(btnBase, btnHover, LEG_COLORS[0], m_algorithm == ALGO_ASTAR ? WHITE : BLACK);
-    btnDijkstra.Draw(btnBase, btnHover, LEG_COLORS[2], m_algorithm == ALGO_DIJKSTRA ? WHITE : BLACK);
-    btnRandomize.Draw(btnBase, btnHover, LEG_COLORS[0], BLACK);
+    btnMod.Draw(btnBase, btnHover, LEG_COLORS[0], isModified ? WHITE : BLACK);
+    btnBaseAlgo.Draw(btnBase, btnHover, LEG_COLORS[2], !isModified ? WHITE : BLACK);
+    btnRandomize.Draw(btnBase, btnHover, LEG_COLORS[1], BLACK);
     btnDrive.Draw(btnBase, btnHover, {230, 60, 60, 255}, m_isDriving ? WHITE : BLACK);
     btnMinusSchool.Draw(btnBase, btnHover, {200, 200, 210, 255}, BLACK);
     btnSchoolCount.Draw(btnBase, btnHover, Fade(LEG_COLORS[1], 0.85f), WHITE);
@@ -654,12 +863,12 @@ void PathfinderState::DrawUI() {
     btnCam.Draw(btnBase, btnHover, LEG_DARK_COLORS[0], WHITE);
 
     // Toolbar interactions
-    if (btnAStar.IsClicked() && m_algorithm != ALGO_ASTAR) {
-        m_algorithm = ALGO_ASTAR;
+    if (btnMod.IsClicked() && m_routingAlgorithm != ROUTING_DP_MODIFIED) {
+        m_routingAlgorithm = ROUTING_DP_MODIFIED;
         OptimizeAndBuildRoutes();
     }
-    if (btnDijkstra.IsClicked() && m_algorithm != ALGO_DIJKSTRA) {
-        m_algorithm = ALGO_DIJKSTRA;
+    if (btnBaseAlgo.IsClicked() && m_routingAlgorithm != ROUTING_DP_BASELINE) {
+        m_routingAlgorithm = ROUTING_DP_BASELINE;
         OptimizeAndBuildRoutes();
     }
     if (btnRandomize.IsClicked()) {
@@ -672,7 +881,7 @@ void PathfinderState::DrawUI() {
         m_numSchools--;
         RandomizePositions();
     }
-    if (btnPlusSchool.IsClicked() && m_numSchools < 6) {
+    if (btnPlusSchool.IsClicked() && m_numSchools < MAX_SCHOOLS) {
         m_numSchools++;
         RandomizePositions();
     }
@@ -681,51 +890,79 @@ void PathfinderState::DrawUI() {
     }
 
     // =========================================================================
-    // 3. Multi-School TSP Route Optimization Card (Left Side)
-    // Displays the optimized sequence, color coding, and algorithm metrics
+    // 3. MBG Routing Optimization Card (Left Side)
+    // Displays the optimized sequence, Time Windows, and algorithm metrics
     // =========================================================================
     int cardX = 16;
     int cardY = navCardY + navCardH + 12;
-    int cardW = 380;
-    int cardH = 220;
+    int cardW = 420;
+    int cardH = 295;
 
-    DrawRectangleRounded((Rectangle){(float)cardX, (float)cardY, (float)cardW, (float)cardH}, 0.08f, 6, Fade((Color){20, 25, 35, 255}, 0.90f));
+    DrawRectangleRounded((Rectangle){(float)cardX, (float)cardY, (float)cardW, (float)cardH}, 0.08f, 6, Fade((Color){20, 25, 35, 255}, 0.92f));
     DrawRectangleRoundedLinesEx((Rectangle){(float)cardX, (float)cardY, (float)cardW, (float)cardH}, 0.08f, 6, 1.5f, Fade(WHITE, 0.25f));
 
-    DrawText("Optimasi Rute Multi-Sekolah (TSP)", cardX + 16, cardY + 12, 16, WHITE);
-    DrawLine(cardX + 16, cardY + 34, cardX + cardW - 16, cardY + 34, Fade(WHITE, 0.2f));
+    DrawText("Sistem Routing MBG (Makan Bergizi Gratis)", cardX + 16, cardY + 12, 15, WHITE);
+    DrawLine(cardX + 16, cardY + 32, cardX + cardW - 16, cardY + 32, Fade(WHITE, 0.2f));
 
-    // Show sequence with colored bullet badges
-    DrawText("Urutan Kunjungan Terbaik:", cardX + 16, cardY + 42, 13, LIGHTGRAY);
+    // Algorithm & Feasibility badge
+    const char* algoName = isModified ? "DP-Modified (Optimized)" : "DP-Baseline (Dijkstra+DP)";
+    Color algoCol = isModified ? (Color){100, 210, 255, 255} : (Color){255, 200, 100, 255};
+    DrawText(TextFormat("Algoritma: %s", algoName), cardX + 16, cardY + 38, 12, algoCol);
 
-    int rowY = cardY + 62;
+    const char* feasStr = m_routeFeasible ? "✓ RUTE LAYAK (Feasible)" : "✗ MELEBIHI WINDOW WAKTU";
+    Color feasCol = m_routeFeasible ? (Color){100, 240, 130, 255} : (Color){255, 80, 80, 255};
+    DrawText(feasStr, cardX + cardW - MeasureText(feasStr, 12) - 16, cardY + 38, 12, feasCol);
+
+    // Sequence header
+    DrawText("Urutan Kunjungan Optimal:", cardX + 16, cardY + 58, 12, LIGHTGRAY);
+
+    // SPPG Central Kitchen start badge
+    DrawRectangleRounded((Rectangle){(float)cardX + 16, (float)cardY + 76, 48, 18}, 0.3f, 4, (Color){255, 180, 0, 255});
+    DrawText("SPPG", cardX + 22, cardY + 78, 11, BLACK);
+    DrawText("Dapur Pusat MBG (Titik Awal)", cardX + 70, cardY + 78, 12, (Color){255, 220, 140, 255});
+
+    int rowY = cardY + 100;
     for (size_t i = 0; i < m_schools.size(); i++) {
         const auto& sch = m_schools[i];
         bool isCurrent = ((int)i == m_currentLegIndex && !m_allDelivered);
         bool isDone = sch.reached;
 
         // Colored badge
-        DrawRectangleRounded((Rectangle){(float)cardX + 16, (float)rowY, 22, 18}, 0.3f, 4, sch.color);
-        DrawText(TextFormat("%d", sch.id), cardX + 23, rowY + 2, 12, WHITE);
+        DrawRectangleRounded((Rectangle){(float)cardX + 16, (float)rowY, 24, 18}, 0.3f, 4, sch.color);
+        DrawText(TextFormat("%d", (int)i + 1), cardX + 24, rowY + 2, 12, WHITE);
 
         // Status string
-        const char* statusStr = isDone ? "✓ Selesai" : (isCurrent ? "▶ Sedang Menuju" : "Menunggu");
+        const char* statusStr = isDone ? "✓ Selesai" : (isCurrent ? (m_isUnloading ? "🍱 Bongkar" : "▶ Menuju") : "Menunggu");
         Color statusColor = isDone ? (Color){100, 240, 130, 255} : (isCurrent ? YELLOW : (Color){180, 190, 205, 255});
 
         float legMeters = (i < m_routeLegs.size()) ? (m_routeLegs[i].path.totalDistanceWorld * 4.0f) : 0.0f;
-        DrawText(TextFormat("Stop %d: %s (%.0f m) • %s", sch.id, LEG_COLOR_NAMES[i % 6], legMeters, statusStr),
-                 cardX + 44, rowY + 2, 12, statusColor);
+        DrawText(TextFormat("%s • [%d-%dm] • %.0fm • %s", sch.name.c_str(), sch.window.start, sch.window.end, legMeters, statusStr),
+                 cardX + 46, rowY + 2, 12, statusColor);
 
-        rowY += 22;
+        rowY += 21;
     }
 
-    // Performance & Distance summary
-    DrawLine(cardX + 16, rowY + 4, cardX + cardW - 16, rowY + 4, Fade(WHITE, 0.15f));
-    rowY += 10;
+    // Final Step (Kembali ke SPPG)
+    bool isReturnLegCurrent = isReturningToDepot && !m_allDelivered;
+    const char* returnStatusStr = m_allDelivered ? "✓ Tiba di SPPG" : (isReturnLegCurrent ? "▶ Sedang Kembali" : "Menunggu");
+    Color returnStatusCol = m_allDelivered ? (Color){100, 240, 130, 255} : (isReturnLegCurrent ? (Color){255, 220, 120, 255} : (Color){180, 190, 205, 255});
 
-    DrawText(TextFormat("Total Jarak Semua Rute: %.1f m", m_totalRouteDistance * 4.0f), cardX + 16, rowY, 12, WHITE);
-    DrawText(TextFormat("Algoritma: %s • Waktu: %.2f ms", (m_algorithm == ALGO_ASTAR) ? "A*" : "Dijkstra", m_totalExecutionTimeMs),
-             cardX + 16, rowY + 18, 12, (m_algorithm == ALGO_ASTAR) ? (Color){100, 235, 120, 255} : ORANGE);
+    float returnMeters = (!m_routeLegs.empty() && m_routeLegs.back().isReturnToDepot) ?
+                         (m_routeLegs.back().path.totalDistanceWorld * 4.0f) : 0.0f;
+
+    DrawRectangleRounded((Rectangle){(float)cardX + 16, (float)rowY, 24, 18}, 0.3f, 4, (Color){255, 180, 0, 255});
+    DrawText("⌂", cardX + 22, rowY + 2, 12, BLACK);
+    DrawText(TextFormat("Kembali ke SPPG (Titik Awal) • %.0fm • %s", returnMeters, returnStatusStr),
+             cardX + 46, rowY + 2, 12, returnStatusCol);
+
+    // Performance & Metrics summary
+    DrawLine(cardX + 16, cardY + cardH - 58, cardX + cardW - 16, cardY + cardH - 58, Fade(WHITE, 0.15f));
+
+    DrawText(TextFormat("Total Cost: %d menit • Total Jarak: %.1f m", m_totalCostMinutes, m_totalRouteDistance * 4.0f),
+             cardX + 16, cardY + cardH - 46, 12, WHITE);
+
+    DrawText(TextFormat("States Explored: %d • Runtime: %.1f µs", m_statesExplored, m_optimizationTimeUs),
+             cardX + 16, cardY + cardH - 26, 12, (Color){140, 230, 255, 255});
 
     // =========================================================================
     // 4. Real-Time 2D Minimap Overlay (Google Maps Style)
@@ -733,14 +970,14 @@ void PathfinderState::DrawUI() {
     // =========================================================================
     if (m_showMinimap && m_world.GetMapTexture().id != 0) {
         Texture2D mapTex = m_world.GetMapTexture();
-        int mmW = 300;
+        int mmW = 310;
         int mmH = (int)(mmW * ((float)m_world.GetGridHeight() / m_world.GetGridWidth()));
         int mmX = screenW - mmW - 16;
         int mmY = screenH - mmH - 16;
 
         DrawRectangleRounded((Rectangle){(float)mmX - 4, (float)mmY - 26, (float)mmW + 8, (float)mmH + 30}, 0.05f, 4, Fade(BLACK, 0.88f));
         DrawRectangleRoundedLinesEx((Rectangle){(float)mmX - 4, (float)mmY - 26, (float)mmW + 8, (float)mmH + 30}, 0.05f, 4, 1.5f, Fade(WHITE, 0.3f));
-        DrawText("Google Maps Multi-Stop Overview", mmX + 6, mmY - 20, 13, WHITE);
+        DrawText("Peta Distribusi Rute MBG", mmX + 6, mmY - 20, 13, WHITE);
 
         // Map Image Texture
         DrawTexturePro(mapTex,
@@ -770,14 +1007,22 @@ void PathfinderState::DrawUI() {
             }
         }
 
+        // Draw SPPG Pin (Dapur Pusat) on minimap
+        float sppgMMX = mmX + (m_carStartGridPos.x / m_world.GetGridWidth()) * mmW;
+        float sppgMMY = mmY + (m_carStartGridPos.y / m_world.GetGridHeight()) * mmH;
+        DrawCircle((int)sppgMMX, (int)sppgMMY, 8, (Color){255, 180, 0, 255});
+        DrawCircle((int)sppgMMX, (int)sppgMMY, 4, WHITE);
+        DrawText("SPPG", (int)sppgMMX - 10, (int)sppgMMY - 14, 9, (Color){255, 230, 100, 255});
+
         // Draw all school pins on minimap
-        for (const auto& sch : m_schools) {
+        for (size_t i = 0; i < m_schools.size(); i++) {
+            const auto& sch = m_schools[i];
             float schMMX = mmX + (sch.gridPos.x / m_world.GetGridWidth()) * mmW;
             float schMMY = mmY + (sch.gridPos.y / m_world.GetGridHeight()) * mmH;
 
             DrawCircle((int)schMMX, (int)schMMY, 7, sch.color);
             DrawCircle((int)schMMX, (int)schMMY, 3, WHITE);
-            DrawText(TextFormat("%d", sch.id), (int)schMMX - 2, (int)schMMY - 12, 10, WHITE);
+            DrawText(TextFormat("%d", (int)i + 1), (int)schMMX - 2, (int)schMMY - 12, 10, WHITE);
         }
 
         // Draw car current position on minimap

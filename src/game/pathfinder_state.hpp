@@ -3,6 +3,11 @@
 #include "fumbo.hpp"
 #include "raycast_world.hpp"
 #include "pathfinder.hpp"
+#include "Common.h"
+#include "Graph.h"
+#include "Dijkstra.h"
+#include "DPBaseline.h"
+#include "DPModified.h"
 #include <string>
 #include <vector>
 
@@ -12,31 +17,40 @@ enum AppCameraMode {
     APP_CAM_FOLLOW_SCHOOL
 };
 
+enum MBGRoutingAlgorithm {
+    ROUTING_DP_MODIFIED = 0,   // DP Modified (Optimized Dominance Pruning & Branch-and-Bound)
+    ROUTING_DP_BASELINE        // DP Baseline (Dijkstra + Dynamic Programming)
+};
+
 // =============================================================================
-// School Destination Definition
+// School Destination Definition for MBG (Makan Bergizi Gratis)
 // =============================================================================
 struct SchoolDestination {
     int id;                   // 1-based index (1, 2, 3...)
-    std::string name;         // "Sekolah 1", "Sekolah 2", etc.
+    std::string name;         // "SDN 01", "SDN 02", etc.
     Vector2 gridPos;
     Vector3 worldPos;
+    TimeWindow window;        // [start, end] in minutes (jam pengantaran makanan)
+    int unloadTime = 5;       // Waktu bongkar muatan makanan bergizi (menit)
     Color color;              // Visual color matching its route leg
     Color darkColor;
     bool reached = false;
 };
 
 // =============================================================================
-// Route Leg (Path segment connecting Car -> School 1 -> School 2 -> School 3)
+// Route Leg (Path segment connecting SPPG -> School 1 -> School 2 -> School 3)
 // Each leg has its own distinct color and 3D ribbon model
 // =============================================================================
 struct RouteLeg {
     int legIndex;             // 0, 1, 2...
-    int targetSchoolIndex;    // index into m_schools array
+    int targetSchoolIndex;    // index into m_schools array (-1 for return to SPPG)
+    std::string destinationName; // Name of destination
     Color color;              // Unique color for this leg (Blue, Green, Orange, etc.)
     PathResult path;
     Model pathModel;          // Core colored ribbon
     Model borderModel;        // White border underlay
     bool modelsLoaded = false;
+    bool isReturnToDepot = false; // True if this leg is returning to SPPG (Titik Awal)!
 };
 
 class PathfinderState : public IGameState {
@@ -53,15 +67,24 @@ public:
 private:
     // =========================================================================
     // MULTI-SCHOOL CONFIGURATION: Jumlah sekolah tujuan (bisa diubah!)
-    // Minimal 3 sekolah sesuai permintaan, bisa diubah ke 4, 5, dll.
+    // Minimal 3 sekolah sesuai permintaan, default 3, max 5 (MAX_SCHOOLS di Common.h)
     // =========================================================================
     static const int DEFAULT_NUM_SCHOOLS = 3;
     int m_numSchools = DEFAULT_NUM_SCHOOLS; // <<-- UBAH VARIABEL INI (misal: 3, 4, 5)
 
+    // MBG Routing Algorithm Configuration
+    MBGRoutingAlgorithm m_routingAlgorithm = ROUTING_DP_MODIFIED;
+    int m_cookTime = 0;                     // Waktu selesai memasak di SPPG (0 menit / 07:00)
+    bool m_routeFeasible = true;            // Kelayakan rute terhadap time window & freshness (240m)
+    int m_totalCostMinutes = 0;             // Total cost rute dalam menit
+    int m_statesExplored = 0;               // Jumlah states dieksplorasi (pada DP Modified)
+    double m_optimizationTimeUs = 0.0;      // Waktu eksekusi optimasi MBG (µs)
+    std::vector<int> m_optimalSequence;     // Urutan id sekolah hasil optimasi
+
     // Core systems
     RaycastWorld m_world;
     Pathfinder m_pathfinder;
-    AlgorithmType m_algorithm = ALGO_ASTAR;
+    AlgorithmType m_gridPathAlgo = ALGO_ASTAR;
 
     // 3D Models
     Model m_truckModel;
@@ -69,7 +92,7 @@ private:
     bool m_truckLoaded = false;
     bool m_schoolLoaded = false;
 
-    // Vehicle state
+    // Vehicle state (SPPG Central Kitchen & Truck)
     Vector2 m_carStartGridPos = {0, 0};
     Vector3 m_carCurrentPos = {0, 0, 0};
     float m_carHeading = 0.0f;
@@ -84,6 +107,10 @@ private:
     bool m_allDelivered = false;       // All schools visited
     float m_arrivalTimer = 0.0f;       // Timer after completing all schools
     float m_pulseTimer = 0.0f;
+
+    // Unloading simulation at school
+    bool m_isUnloading = false;
+    float m_unloadTimer = 0.0f;
 
     // Navigation metrics
     float m_distanceToCurrentTarget = 0.0f;

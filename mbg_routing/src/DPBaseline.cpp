@@ -59,7 +59,7 @@ DPResult dpBaseline(const Graph& g, int sppg, const std::vector<School>& schools
 
                     if (new_cost < dp[next_pos][new_mask][new_time]) {
                         dp[next_pos][new_mask][new_time] = new_cost;
-                        parent[next_pos][new_mask][new_time] = {pos, mask};
+                        parent[next_pos][new_mask][new_time] = {pos, time};
                     }
                 }
             }
@@ -70,13 +70,33 @@ DPResult dpBaseline(const Graph& g, int sppg, const std::vector<School>& schools
     result.total_cost = INF;
     result.feasible = false;
 
+    int best_pos = -1;
+    int best_time = -1;
+
     for (int pos = 0; pos < num_locs; ++pos) {
         for (int time = cook_time; time <= MAX_TIME; ++time) {
             if (dp[pos][full_mask][time] < result.total_cost) {
                 result.total_cost = dp[pos][full_mask][time];
                 result.feasible = true;
+                best_pos = pos;
+                best_time = time;
             }
         }
+    }
+
+    if (result.feasible && best_pos > 0) {
+        int cur_pos = best_pos;
+        int cur_mask = full_mask;
+        int cur_time = best_time;
+
+        while (cur_pos > 0 && cur_mask > 0) {
+            result.route.push_back(schools[cur_pos - 1].id);
+            auto [p_pos, p_time] = parent[cur_pos][cur_mask][cur_time];
+            cur_mask ^= (1 << (cur_pos - 1));
+            cur_pos = p_pos;
+            cur_time = p_time;
+        }
+        std::reverse(result.route.begin(), result.route.end());
     }
 
     return result;

@@ -31,6 +31,9 @@ int main() {
     std::cout << "=== Baseline (Dijkstra + DP) ===" << std::endl;
     std::cout << "Total cost: " << result1.total_cost << std::endl;
     std::cout << "Feasible: " << (result1.feasible ? "Yes" : "No") << std::endl;
+    std::cout << "Route: ";
+    for (int id : result1.route) std::cout << id << " ";
+    std::cout << std::endl;
     std::cout << "Time: " << duration1.count() << " microseconds" << std::endl;
 
     auto start2 = std::chrono::high_resolution_clock::now();
@@ -41,6 +44,9 @@ int main() {
     std::cout << "\n=== Modified (Optimized) ===" << std::endl;
     std::cout << "Total cost: " << result2.total_cost << std::endl;
     std::cout << "Feasible: " << (result2.feasible ? "Yes" : "No") << std::endl;
+    std::cout << "Route: ";
+    for (int id : result2.route) std::cout << id << " ";
+    std::cout << std::endl;
     std::cout << "States explored: " << result2.states_explored << std::endl;
     std::cout << "Time: " << duration2.count() << " microseconds" << std::endl;
 

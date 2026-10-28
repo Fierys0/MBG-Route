@@ -35,31 +35,51 @@ void updateDominanceMap(int pos, int mask, int time, int cost, DominanceMap& dom
     sorted_states[time] = cost;
 }
 
-int greedyUpperBound(const Graph& g, int sppg, const std::vector<School>& schools, int cook_time) {
+int greedyUpperBound(const Graph& g, int sppg, const std::vector<School>& schools, int cook_time, std::vector<int>& greedy_route) {
     int current = sppg;
     int total = 0;
     int time = cook_time;
     std::set<int> unvisited;
-    for (int i = 0; i < schools.size(); ++i) {
-        unvisited.insert(i);
+    for (size_t i = 0; i < schools.size(); ++i) {
+        unvisited.insert((int)i);
     }
+    greedy_route.clear();
 
     while (!unvisited.empty()) {
         int best_next = -1;
         int best_dist = INF;
 
+        auto result = dijkstra(g, current);
+        if (!result.success) {
+            greedy_route.clear();
+            return INF;
+        }
+
         for (int next : unvisited) {
-            auto result = dijkstra(g, current);
-            int d = result.dist[schools[next].id];
-            if (d < best_dist) {
-                best_dist = d;
-                best_next = next;
+            auto it = result.dist.find(schools[next].id);
+            if (it == result.dist.end() || it->second == INF) continue;
+            int d = it->second;
+
+            int arrival = time + d;
+            int food_age = arrival - cook_time;
+            if (food_age <= MAX_TIME && arrival <= schools[next].window.end) {
+                if (d < best_dist) {
+                    best_dist = d;
+                    best_next = next;
+                }
             }
         }
 
+        if (best_next == -1 || best_dist == INF) {
+            greedy_route.clear();
+            return INF;
+        }
+
         total += best_dist;
-        time += best_dist + schools[best_next].unload_time;
+        int arrival = std::max(time + best_dist, schools[best_next].window.start);
+        time = arrival + schools[best_next].unload_time;
         current = schools[best_next].id;
+        greedy_route.push_back(schools[best_next].id);
         unvisited.erase(best_next);
     }
 
@@ -67,26 +87,38 @@ int greedyUpperBound(const Graph& g, int sppg, const std::vector<School>& school
 }
 
 DPModifiedResult dpModified(const Graph& g, int sppg, const std::vector<School>& schools, int cook_time) {
-    int n = schools.size();
+    int n = (int)schools.size();
     int full_mask = (1 << n) - 1;
 
     DominanceMap dominance_map;
     std::unordered_map<int, int> dp;
-    std::unordered_map<int, std::pair<int, int>> parent;
 
-    int best_cost = greedyUpperBound(g, sppg, schools, cook_time);
+    std::vector<int> best_route;
+    int best_cost = greedyUpperBound(g, sppg, schools, cook_time, best_route);
 
     int initial_key = (0 * 1000 + 0) * 1000 + cook_time;
     dp[initial_key] = 0;
     updateDominanceMap(0, 0, cook_time, 0, dominance_map);
 
-    std::priority_queue<State> frontier;
-    frontier.push({0, 0, cook_time, 0});
+    struct SearchState {
+        int pos;
+        int mask;
+        int time;
+        int cost;
+        std::vector<int> path;
+
+        bool operator<(const SearchState& other) const {
+            return cost > other.cost;
+        }
+    };
+
+    std::priority_queue<SearchState> frontier;
+    frontier.push({0, 0, cook_time, 0, {}});
 
     int states_explored = 0;
 
     while (!frontier.empty()) {
-        State current = frontier.top();
+        SearchState current = frontier.top();
         frontier.pop();
         states_explored++;
 
@@ -101,9 +133,12 @@ DPModifiedResult dpModified(const Graph& g, int sppg, const std::vector<School>&
 
             int current_loc = (current.pos == 0) ? sppg : schools[current.pos - 1].id;
             auto result = dijkstra(g, current_loc);
-            if (!result.success || result.dist[schools[next].id] == INF) continue;
+            if (!result.success) continue;
 
-            int travel = result.dist[schools[next].id];
+            auto it = result.dist.find(schools[next].id);
+            if (it == result.dist.end() || it->second == INF) continue;
+
+            int travel = it->second;
             int arrival = current.time + travel;
             int food_age = arrival - cook_time;
             if (food_age > MAX_TIME) continue;
@@ -116,26 +151,29 @@ DPModifiedResult dpModified(const Graph& g, int sppg, const std::vector<School>&
             int new_time = arrival + schools[next].unload_time;
             int new_mask = current.mask | (1 << next);
             int new_cost = current.cost + travel;
+            int new_pos = next + 1;
 
             if (new_cost >= best_cost) continue;
 
-            int new_key = (next * 1000 + new_mask) * 1000 + new_time;
+            int new_key = (new_pos * 1000 + new_mask) * 1000 + new_time;
             int existing = dp.count(new_key) ? dp[new_key] : INF;
 
             if (new_cost < existing) {
                 dp[new_key] = new_cost;
-                parent[new_key] = {current.pos, current.mask};
-                updateDominanceMap(next, new_mask, new_time, new_cost, dominance_map);
+                updateDominanceMap(new_pos, new_mask, new_time, new_cost, dominance_map);
 
-                State new_state;
-                new_state.pos = next;
+                SearchState new_state;
+                new_state.pos = new_pos;
                 new_state.mask = new_mask;
                 new_state.time = new_time;
                 new_state.cost = new_cost;
+                new_state.path = current.path;
+                new_state.path.push_back(schools[next].id);
                 frontier.push(new_state);
 
                 if (new_mask == full_mask && new_cost < best_cost) {
                     best_cost = new_cost;
+                    best_route = new_state.path;
                 }
             }
         }
@@ -143,7 +181,8 @@ DPModifiedResult dpModified(const Graph& g, int sppg, const std::vector<School>&
 
     DPModifiedResult result;
     result.total_cost = best_cost;
-    result.feasible = (best_cost < INF);
+    result.route = best_route;
+    result.feasible = (best_cost < INF && !best_route.empty());
     result.states_explored = states_explored;
 
     return result;

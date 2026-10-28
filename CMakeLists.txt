@@ -47,7 +47,13 @@ set_target_properties(fumbo_engine PROPERTIES
 )
 
 file(GLOB_RECURSE GAME_SOURCES src/*.cpp)
-add_executable(${PROJECT_NAME} ${GAME_SOURCES})
+set(MBG_ROUTING_SOURCES
+    mbg_routing/src/Graph.cpp
+    mbg_routing/src/Dijkstra.cpp
+    mbg_routing/src/DPBaseline.cpp
+    mbg_routing/src/DPModified.cpp
+)
+add_executable(${PROJECT_NAME} ${GAME_SOURCES} ${MBG_ROUTING_SOURCES})
 
 # Put executable in "bin" folder
 set_target_properties(${PROJECT_NAME} PROPERTIES
@@ -70,6 +76,7 @@ target_include_directories(${PROJECT_NAME}
         src
         engine
         engine/lib/raylib/src
+        mbg_routing/include
         ${CMAKE_BINARY_DIR}/cmake   # for generated_buildinfo.hpp
 )
 
