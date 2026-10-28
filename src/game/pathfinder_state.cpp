@@ -43,7 +43,7 @@ struct StateButton {
         return CheckCollisionPointRec(mouse, rect) && IsMouseButtonPressed(MOUSE_BUTTON_LEFT);
     }
 
-    void Draw(Color baseCol, Color hoverCol, Color activeCol, Color textCol) const {
+    void Draw(Font font, Color baseCol, Color hoverCol, Color activeCol, Color textCol) const {
         Vector2 mouse = GetMousePosition();
         bool hovered = CheckCollisionPointRec(mouse, rect);
         Color col = active ? activeCol : (hovered ? hoverCol : baseCol);
@@ -51,11 +51,16 @@ struct StateButton {
         DrawRectangleRounded(rect, 0.28f, 4, col);
         DrawRectangleRoundedLinesEx(rect, 0.28f, 4, 1.5f, Fade(BLACK, 0.4f));
 
-        int fontSize = 13;
-        int textW = MeasureText(label, fontSize);
+        float fontSize = 12.0f;
+        float spacing = 0.5f;
+        float textW = (font.texture.id > 0) ? MeasureTextEx(font, label, fontSize, spacing).x : (float)MeasureText(label, (int)fontSize);
         float tx = rect.x + (rect.width - textW) * 0.5f;
-        float ty = rect.y + (rect.height - fontSize) * 0.5f;
-        DrawText(label, (int)tx, (int)ty, fontSize, textCol);
+        float ty = rect.y + (rect.height - fontSize) * 0.5f - 1.0f;
+        if (font.texture.id > 0) {
+            DrawTextEx(font, label, (Vector2){tx, ty}, fontSize, spacing, textCol);
+        } else {
+            DrawText(label, (int)tx, (int)ty, (int)fontSize, textCol);
+        }
     }
 };
 
@@ -68,8 +73,115 @@ PathfinderState::~PathfinderState() {
     Cleanup();
 }
 
+void PathfinderState::LoadFonts() {
+    // Collect standard character codepoints: Basic ASCII + Latin-1 + Navigation symbols supported by Montserrat
+    std::vector<int> codepoints;
+    for (int i = 32; i < 127; i++) codepoints.push_back(i); // ASCII 32-126
+    for (int i = 160; i < 256; i++) codepoints.push_back(i); // Latin-1
+    codepoints.push_back(0x2022); // • (Bullet)
+    codepoints.push_back(0x2190); // ← (Left)
+    codepoints.push_back(0x2191); // ↑ (Up)
+    codepoints.push_back(0x2192); // → (Right)
+    codepoints.push_back(0x2193); // ↓ (Down)
+    codepoints.push_back(0x25B6); // ▶ (Play / Target)
+    codepoints.push_back(0x25C0); // ◀ (Reverse)
+    codepoints.push_back(0x25B2); // ▲ (Up triangle)
+    codepoints.push_back(0x25BC); // ▼ (Down triangle)
+
+    auto loadSingleFont = [&](const std::string& path, int fontSize) -> Font {
+        // 1. Try loading from asset pack first
+        for (const auto& pack : Fumbo::Assets::GetAssetPacks()) {
+            if (pack && pack->IsLoaded() && pack->HasAsset(path)) {
+                std::vector<uint8_t> data = pack->LoadAsset(path);
+                if (!data.empty()) {
+                    const char* ext = GetFileExtension(path.c_str());
+                    Font f = LoadFontFromMemory(ext, data.data(), (int)data.size(), fontSize, codepoints.data(), (int)codepoints.size());
+                    if (f.texture.id > 0) {
+                        SetTextureFilter(f.texture, TEXTURE_FILTER_BILINEAR);
+                        TraceLog(LOG_INFO, "[Montserrat] Loaded %s from pack (size=%d, glyphs=%d)", path.c_str(), fontSize, f.glyphCount);
+                        return f;
+                    }
+                }
+            }
+        }
+        // 2. Try loading from raw filesystem
+        if (FileExists(path.c_str())) {
+            Font f = LoadFontEx(path.c_str(), fontSize, codepoints.data(), (int)codepoints.size());
+            if (f.texture.id > 0) {
+                SetTextureFilter(f.texture, TEXTURE_FILTER_BILINEAR);
+                TraceLog(LOG_INFO, "[Montserrat] Loaded %s from file (size=%d, glyphs=%d)", path.c_str(), fontSize, f.glyphCount);
+                return f;
+            }
+        }
+        // 3. Fallback to Fumbo default font loader
+        Font f = Fumbo::Assets::LoadFont(path, fontSize);
+        if (f.texture.id > 0) SetTextureFilter(f.texture, TEXTURE_FILTER_BILINEAR);
+        return f;
+    };
+
+    m_fontBold = loadSingleFont("assets/fonts/Montserrat-Bold.ttf", 40);
+    m_fontSemiBold = loadSingleFont("assets/fonts/Montserrat-SemiBold.ttf", 34);
+    m_fontRegular = loadSingleFont("assets/fonts/Montserrat-Medium.ttf", 28);
+    if (m_fontRegular.texture.id == 0) {
+        m_fontRegular = loadSingleFont("assets/fonts/Montserrat-Regular.ttf", 28);
+    }
+
+    m_fontsLoaded = (m_fontRegular.texture.id > 0 || m_fontSemiBold.texture.id > 0 || m_fontBold.texture.id > 0);
+    TraceLog(LOG_INFO, "Montserrat Fonts Loaded successfully (Bold=%d, SemiBold=%d, Regular=%d)",
+             m_fontBold.texture.id, m_fontSemiBold.texture.id, m_fontRegular.texture.id);
+}
+
+void PathfinderState::UnloadFonts() {
+    if (m_fontBold.texture.id > 0) {
+        UnloadFont(m_fontBold);
+        m_fontBold = {0};
+    }
+    if (m_fontSemiBold.texture.id > 0) {
+        UnloadFont(m_fontSemiBold);
+        m_fontSemiBold = {0};
+    }
+    if (m_fontRegular.texture.id > 0) {
+        UnloadFont(m_fontRegular);
+        m_fontRegular = {0};
+    }
+    m_fontsLoaded = false;
+}
+
+void PathfinderState::DrawTextCustom(const char* text, float x, float y, float size, Color color, FontStyle style) const {
+    Font f = m_fontRegular;
+    if (style == FONT_BOLD && m_fontBold.texture.id > 0) f = m_fontBold;
+    else if (style == FONT_SEMIBOLD && m_fontSemiBold.texture.id > 0) f = m_fontSemiBold;
+    else if (m_fontRegular.texture.id > 0) f = m_fontRegular;
+    else if (m_fontSemiBold.texture.id > 0) f = m_fontSemiBold;
+
+    if (f.texture.id > 0) {
+        float spacing = 0.5f;
+        DrawTextEx(f, text, (Vector2){x, y}, size, spacing, color);
+    } else {
+        DrawText(text, (int)x, (int)y, (int)size, color);
+    }
+}
+
+float PathfinderState::MeasureTextCustom(const char* text, float size, FontStyle style) const {
+    Font f = m_fontRegular;
+    if (style == FONT_BOLD && m_fontBold.texture.id > 0) f = m_fontBold;
+    else if (style == FONT_SEMIBOLD && m_fontSemiBold.texture.id > 0) f = m_fontSemiBold;
+    else if (m_fontRegular.texture.id > 0) f = m_fontRegular;
+    else if (m_fontSemiBold.texture.id > 0) f = m_fontSemiBold;
+
+    if (f.texture.id > 0) {
+        float spacing = 0.5f;
+        return MeasureTextEx(f, text, size, spacing).x;
+    } else {
+        return (float)MeasureText(text, (int)size);
+    }
+}
+
 void PathfinderState::Init() {
-    TraceLog(LOG_INFO, "Initializing PathfinderState with MBG Routing Algorithm...");
+    TraceLog(LOG_INFO, "Initializing PathfinderState with MBG Routing Algorithm & Montserrat Fonts...");
+
+    // 0. Load Montserrat Typography from assets/fonts
+    LoadFonts();
 
     // 1. Generate 3D procedural world using Ray Casting against map image
     bool ok = m_world.GenerateFromImage("assets/map.jpg", 6);
@@ -103,6 +215,7 @@ void PathfinderState::Init() {
 
 void PathfinderState::Cleanup() {
     UnloadRouteModels();
+    UnloadFonts();
 
     if (m_truckLoaded) {
         UnloadModel(m_truckModel);
@@ -324,7 +437,7 @@ void PathfinderState::OptimizeAndBuildRoutes() {
         m_schools[i].color = LEG_COLORS[i % 6];
         m_schools[i].darkColor = LEG_DARK_COLORS[i % 6];
         m_schools[i].reached = false;
-        m_optimizationLog += TextFormat(" ➔ [%d] %s (%s)", (int)i + 1, m_schools[i].name.c_str(), LEG_COLOR_NAMES[i % 6]);
+        m_optimizationLog += TextFormat(" → [%d] %s (%s)", (int)i + 1, m_schools[i].name.c_str(), LEG_COLOR_NAMES[i % 6]);
     }
 
     // Build the routes and 3D colored ribbon meshes for each leg
@@ -407,7 +520,7 @@ void PathfinderState::OptimizeAndBuildRoutes() {
         }
 
         m_routeLegs.push_back(returnLeg);
-        m_optimizationLog += " ➔ [Akhir] SPPG (Kembali ke Titik Awal)";
+        m_optimizationLog += " → [Akhir] SPPG (Kembali ke Titik Awal)";
     }
 
     UpdateNavigationStatus();
@@ -616,7 +729,19 @@ void PathfinderState::Update() {
     }
     if (IsKeyPressed(KEY_F)) m_camMode = APP_CAM_FREE;
     if (IsKeyPressed(KEY_L)) m_showLidar = !m_showLidar;
-    if (IsKeyPressed(KEY_M)) m_showMinimap = !m_showMinimap;
+    if (IsKeyPressed(KEY_M)) {
+        m_mapFullscreen = !m_mapFullscreen;
+        if (!m_mapFullscreen) {
+            m_mapZoom = 1.0f;
+            m_mapPan = {0, 0};
+        }
+    }
+    if (IsKeyPressed(KEY_ESCAPE) && m_mapFullscreen) {
+        m_mapFullscreen = false;
+        m_mapZoom = 1.0f;
+        m_mapPan = {0, 0};
+    }
+    if (IsKeyPressed(KEY_H)) m_showMinimap = !m_showMinimap;
 
     // Adjust school count via keyboard '+' and '-' (3 to 5)
     if (IsKeyPressed(KEY_EQUAL) || IsKeyPressed(KEY_KP_ADD)) {
@@ -771,62 +896,65 @@ void PathfinderState::DrawUI() {
     DrawRectangleRoundedLinesEx((Rectangle){(float)navCardX, (float)navCardY, (float)navCardW, (float)navCardH}, 0.12f, 6, 2.0f, Fade(WHITE, 0.45f));
 
     if (m_allDelivered) {
-        DrawText("✓ MISI MBG SELESAI!", navCardX + 22, navCardY + 20, 22, WHITE);
-        DrawText(TextFormat("Seluruh %d sekolah terlayani & mobil kembali ke titik awal (SPPG)!", (int)m_schools.size()),
-                 navCardX + 22, navCardY + 50, 13, (Color){220, 255, 230, 255});
-        DrawText("Memulai misi baru dalam 4 detik...", navCardX + 22, navCardY + 70, 12, (Color){200, 240, 210, 255});
+        DrawTextCustom("MISI MBG SELESAI!", navCardX + 22, navCardY + 18, 20, WHITE, FONT_BOLD);
+        DrawTextCustom(TextFormat("Seluruh %d sekolah terlayani & mobil kembali ke titik awal (SPPG)!", (int)m_schools.size()),
+                       navCardX + 22, navCardY + 48, 12.5f, (Color){220, 255, 230, 255}, FONT_REGULAR);
+        DrawTextCustom("Memulai misi baru dalam 4 detik...", navCardX + 22, navCardY + 68, 11.5f, (Color){200, 240, 210, 255}, FONT_REGULAR);
     } else if (isReturningToDepot) {
         // Return to depot header
-        DrawText("⌂", navCardX + 22, navCardY + 24, 30, WHITE);
-        DrawText(m_turnInstruction.c_str(), navCardX + 74, navCardY + 12, 19, WHITE);
-        DrawText("Langkah Akhir: Kembali ke Titik Awal (SPPG)", navCardX + 74, navCardY + 38, 14, WHITE);
+        const char* retIcon = "↑";
+        if (m_turnInstruction == "Belok Kanan") retIcon = "→";
+        else if (m_turnInstruction == "Belok Kiri") retIcon = "←";
+        DrawTextCustom(retIcon, navCardX + 26, navCardY + 18, 28, WHITE, FONT_BOLD);
+        DrawTextCustom(m_turnInstruction.c_str(), navCardX + 70, navCardY + 12, 18, WHITE, FONT_BOLD);
+        DrawTextCustom("Langkah Akhir: Kembali ke Titik Awal (SPPG)", navCardX + 70, navCardY + 36, 13, WHITE, FONT_SEMIBOLD);
 
         float metersCurrent = m_distanceToCurrentTarget * 4.0f;
         int etaSeconds = (int)(m_distanceToCurrentTarget / m_driveSpeed);
-        DrawText(TextFormat("Sisa Jarak ke SPPG: %.0f m (%d dtk) • Menuju Pangkalan", metersCurrent, etaSeconds),
-                 navCardX + 74, navCardY + 62, 13, (Color){255, 255, 180, 255});
-        DrawText("✓ Pengiriman makanan bergizi di seluruh sekolah telah selesai",
-                 navCardX + 74, navCardY + 82, 12, (Color){255, 245, 220, 255});
+        DrawTextCustom(TextFormat("Sisa Jarak ke SPPG: %.0f m (%d dtk) • Menuju Pangkalan", metersCurrent, etaSeconds),
+                       navCardX + 70, navCardY + 58, 12, (Color){255, 255, 180, 255}, FONT_REGULAR);
+        DrawTextCustom("Pengiriman makanan bergizi di seluruh sekolah telah selesai",
+                       navCardX + 70, navCardY + 78, 11, (Color){255, 245, 220, 255}, FONT_REGULAR);
 
         DrawCircle(navCardX + navCardW - 20, navCardY + 20, 6, (Color){255, 230, 0, 255});
-        DrawText("KEMBALI", navCardX + navCardW - 74, navCardY + 16, 9, BLACK);
+        DrawTextCustom("KEMBALI", navCardX + navCardW - 74, navCardY + 15, 9, BLACK, FONT_BOLD);
     } else {
         // Navigation icon
         const char* iconStr = "↑";
-        if (m_turnInstruction == "Belok Kanan") iconStr = "↱";
-        else if (m_turnInstruction == "Belok Kiri") iconStr = "↰";
-        else if (m_isUnloading) iconStr = "🍱";
-        DrawText(iconStr, navCardX + 22, navCardY + 24, 30, WHITE);
+        if (m_turnInstruction == "Belok Kanan") iconStr = "→";
+        else if (m_turnInstruction == "Belok Kiri") iconStr = "←";
+        else if (m_isUnloading) iconStr = "▶";
+        DrawTextCustom(iconStr, navCardX + 26, navCardY + 18, 28, WHITE, FONT_BOLD);
 
         // Turn instruction
-        DrawText(m_turnInstruction.c_str(), navCardX + 74, navCardY + 12, 20, WHITE);
+        DrawTextCustom(m_turnInstruction.c_str(), navCardX + 70, navCardY + 12, 18, WHITE, FONT_BOLD);
 
         // Destination with school step indicator
         int targetId = m_currentLegIndex + 1;
         const char* colName = (m_currentLegIndex < 6) ? LEG_COLOR_NAMES[m_currentLegIndex] : "Warna";
         const char* schName = (m_currentLegIndex < (int)m_schools.size()) ? m_schools[m_currentLegIndex].name.c_str() : "Sekolah";
 
-        DrawText(TextFormat("Tujuan: %s (Stop %d dari %d • Jalur %s)", schName, targetId, (int)m_schools.size(), colName),
-                 navCardX + 74, navCardY + 38, 14, WHITE);
+        DrawTextCustom(TextFormat("Tujuan: %s (Stop %d dari %d • Jalur %s)", schName, targetId, (int)m_schools.size(), colName),
+                       navCardX + 70, navCardY + 36, 13, WHITE, FONT_SEMIBOLD);
 
         // Distance & ETA
         float metersCurrent = m_distanceToCurrentTarget * 4.0f;
         float metersTotal   = m_totalDistanceRemaining * 4.0f;
         int etaSeconds = (int)(m_distanceToCurrentTarget / m_driveSpeed);
 
-        DrawText(TextFormat("Target: %.0f m (%d dtk) • Total Sisa: %.0f m", metersCurrent, etaSeconds, metersTotal),
-                 navCardX + 74, navCardY + 62, 13, (Color){255, 255, 180, 255});
+        DrawTextCustom(TextFormat("Target: %.0f m (%d dtk) • Total Sisa: %.0f m", metersCurrent, etaSeconds, metersTotal),
+                       navCardX + 70, navCardY + 58, 12, (Color){255, 255, 180, 255}, FONT_REGULAR);
 
         // Time window indicator
         if (m_currentLegIndex < (int)m_schools.size()) {
             const auto& w = m_schools[m_currentLegIndex].window;
-            DrawText(TextFormat("Window Pengantaran: [%d - %d menit] • Bongkar: 5m", w.start, w.end),
-                     navCardX + 74, navCardY + 82, 12, (Color){230, 245, 255, 255});
+            DrawTextCustom(TextFormat("Window Pengantaran: [%d - %d menit] • Bongkar: 5m", w.start, w.end),
+                           navCardX + 70, navCardY + 78, 11, (Color){230, 245, 255, 255}, FONT_REGULAR);
         }
 
         // Pulsing status
         DrawCircle(navCardX + navCardW - 20, navCardY + 20, 6, m_isUnloading ? ORANGE : RED);
-        DrawText(m_isUnloading ? "BONGKAR" : "AUTO", navCardX + navCardW - 68, navCardY + 16, 9, WHITE);
+        DrawTextCustom(m_isUnloading ? "BONGKAR" : "AUTO", navCardX + navCardW - 68, navCardY + 15, 9, WHITE, FONT_BOLD);
     }
 
     // =========================================================================
@@ -836,31 +964,35 @@ void PathfinderState::DrawUI() {
     int toolY = 14;
 
     bool isModified = (m_routingAlgorithm == ROUTING_DP_MODIFIED);
-    StateButton btnMod      = {{(float)toolX, (float)toolY, 145, 38}, "DP Modified [TAB]", isModified};
-    StateButton btnBaseAlgo = {{(float)toolX + 152, (float)toolY, 140, 38}, "DP Baseline", !isModified};
-    StateButton btnRandomize= {{(float)toolX + 298, (float)toolY, 120, 38}, "Acak Rute [R]", false};
-    StateButton btnDrive    = {{(float)toolX + 424, (float)toolY, 115, 38}, m_isDriving ? "Jeda [SPACE]" : "Auto Jalan", m_isDriving};
+    StateButton btnMod      = {{(float)toolX, (float)toolY, 138, 36}, "DP Modified [TAB]", isModified};
+    StateButton btnBaseAlgo = {{(float)toolX + 144, (float)toolY, 120, 36}, "DP Baseline", !isModified};
+    StateButton btnRandomize= {{(float)toolX + 270, (float)toolY, 110, 36}, "Acak Rute [R]", false};
+    StateButton btnDrive    = {{(float)toolX + 386, (float)toolY, 105, 36}, m_isDriving ? "Jeda [SPACE]" : "Auto Jalan", m_isDriving};
+    StateButton btnMap      = {{(float)toolX + 497, (float)toolY, 135, 36}, m_mapFullscreen ? "Tutup Peta [M]" : "Peta Penuh [M]", m_mapFullscreen};
 
-    // Buttons to adjust number of schools live! (3 to 5)
-    StateButton btnMinusSchool = {{(float)toolX + 545, (float)toolY, 36, 38}, "[-]", false};
-    StateButton btnSchoolCount = {{(float)toolX + 586, (float)toolY, 90, 38}, TextFormat("%d Sekolah", m_numSchools), true};
-    StateButton btnPlusSchool  = {{(float)toolX + 681, (float)toolY, 36, 38}, "[+]", false};
+    // Row 2 of controls (Schools count + Camera toggle)
+    int row2Y = toolY + 42;
+    StateButton btnMinusSchool = {{(float)toolX, (float)row2Y, 34, 32}, "[-]", false};
+    StateButton btnSchoolCount = {{(float)toolX + 38, (float)row2Y, 86, 32}, TextFormat("%d Sekolah", m_numSchools), true};
+    StateButton btnPlusSchool  = {{(float)toolX + 128, (float)row2Y, 34, 32}, "[+]", false};
 
-    StateButton btnCam = {{(float)toolX + 724, (float)toolY, 115, 38},
+    StateButton btnCam = {{(float)toolX + 168, (float)row2Y, 115, 32},
                           (m_camMode == APP_CAM_FOLLOW_CAR) ? "Cam: Truk [C]" : "Cam: Sek [S]",
                           m_camMode == APP_CAM_FOLLOW_CAR};
 
     Color btnBase = {240, 244, 250, 255};
     Color btnHover = {215, 230, 250, 255};
 
-    btnMod.Draw(btnBase, btnHover, LEG_COLORS[0], isModified ? WHITE : BLACK);
-    btnBaseAlgo.Draw(btnBase, btnHover, LEG_COLORS[2], !isModified ? WHITE : BLACK);
-    btnRandomize.Draw(btnBase, btnHover, LEG_COLORS[1], BLACK);
-    btnDrive.Draw(btnBase, btnHover, {230, 60, 60, 255}, m_isDriving ? WHITE : BLACK);
-    btnMinusSchool.Draw(btnBase, btnHover, {200, 200, 210, 255}, BLACK);
-    btnSchoolCount.Draw(btnBase, btnHover, Fade(LEG_COLORS[1], 0.85f), WHITE);
-    btnPlusSchool.Draw(btnBase, btnHover, {200, 200, 210, 255}, BLACK);
-    btnCam.Draw(btnBase, btnHover, LEG_DARK_COLORS[0], WHITE);
+    btnMod.Draw(m_fontSemiBold, btnBase, btnHover, LEG_COLORS[0], isModified ? WHITE : BLACK);
+    btnBaseAlgo.Draw(m_fontSemiBold, btnBase, btnHover, LEG_COLORS[2], !isModified ? WHITE : BLACK);
+    btnRandomize.Draw(m_fontSemiBold, btnBase, btnHover, LEG_COLORS[1], BLACK);
+    btnDrive.Draw(m_fontSemiBold, btnBase, btnHover, {230, 60, 60, 255}, m_isDriving ? WHITE : BLACK);
+    btnMap.Draw(m_fontSemiBold, btnBase, btnHover, (Color){30, 144, 255, 255}, m_mapFullscreen ? WHITE : BLACK);
+
+    btnMinusSchool.Draw(m_fontBold, btnBase, btnHover, {200, 200, 210, 255}, BLACK);
+    btnSchoolCount.Draw(m_fontSemiBold, btnBase, btnHover, Fade(LEG_COLORS[1], 0.85f), WHITE);
+    btnPlusSchool.Draw(m_fontBold, btnBase, btnHover, {200, 200, 210, 255}, BLACK);
+    btnCam.Draw(m_fontSemiBold, btnBase, btnHover, LEG_DARK_COLORS[0], WHITE);
 
     // Toolbar interactions
     if (btnMod.IsClicked() && m_routingAlgorithm != ROUTING_DP_MODIFIED) {
@@ -876,6 +1008,13 @@ void PathfinderState::DrawUI() {
     }
     if (btnDrive.IsClicked()) {
         m_isDriving = !m_isDriving;
+    }
+    if (btnMap.IsClicked()) {
+        m_mapFullscreen = !m_mapFullscreen;
+        if (!m_mapFullscreen) {
+            m_mapZoom = 1.0f;
+            m_mapPan = {0, 0};
+        }
     }
     if (btnMinusSchool.IsClicked() && m_numSchools > 3) {
         m_numSchools--;
@@ -901,25 +1040,25 @@ void PathfinderState::DrawUI() {
     DrawRectangleRounded((Rectangle){(float)cardX, (float)cardY, (float)cardW, (float)cardH}, 0.08f, 6, Fade((Color){20, 25, 35, 255}, 0.92f));
     DrawRectangleRoundedLinesEx((Rectangle){(float)cardX, (float)cardY, (float)cardW, (float)cardH}, 0.08f, 6, 1.5f, Fade(WHITE, 0.25f));
 
-    DrawText("Sistem Routing MBG (Makan Bergizi Gratis)", cardX + 16, cardY + 12, 15, WHITE);
+    DrawTextCustom("Sistem Routing MBG (Makan Bergizi Gratis)", cardX + 16, cardY + 12, 14, WHITE, FONT_BOLD);
     DrawLine(cardX + 16, cardY + 32, cardX + cardW - 16, cardY + 32, Fade(WHITE, 0.2f));
 
     // Algorithm & Feasibility badge
     const char* algoName = isModified ? "DP-Modified (Optimized)" : "DP-Baseline (Dijkstra+DP)";
     Color algoCol = isModified ? (Color){100, 210, 255, 255} : (Color){255, 200, 100, 255};
-    DrawText(TextFormat("Algoritma: %s", algoName), cardX + 16, cardY + 38, 12, algoCol);
+    DrawTextCustom(TextFormat("Algoritma: %s", algoName), cardX + 16, cardY + 37, 11.5f, algoCol, FONT_SEMIBOLD);
 
-    const char* feasStr = m_routeFeasible ? "✓ RUTE LAYAK (Feasible)" : "✗ MELEBIHI WINDOW WAKTU";
+    const char* feasStr = m_routeFeasible ? "RUTE LAYAK (Feasible)" : "MELEBIHI WINDOW WAKTU";
     Color feasCol = m_routeFeasible ? (Color){100, 240, 130, 255} : (Color){255, 80, 80, 255};
-    DrawText(feasStr, cardX + cardW - MeasureText(feasStr, 12) - 16, cardY + 38, 12, feasCol);
+    DrawTextCustom(feasStr, cardX + cardW - MeasureTextCustom(feasStr, 11.5f, FONT_BOLD) - 16, cardY + 37, 11.5f, feasCol, FONT_BOLD);
 
     // Sequence header
-    DrawText("Urutan Kunjungan Optimal:", cardX + 16, cardY + 58, 12, LIGHTGRAY);
+    DrawTextCustom("Urutan Kunjungan Optimal:", cardX + 16, cardY + 57, 11.5f, LIGHTGRAY, FONT_SEMIBOLD);
 
     // SPPG Central Kitchen start badge
     DrawRectangleRounded((Rectangle){(float)cardX + 16, (float)cardY + 76, 48, 18}, 0.3f, 4, (Color){255, 180, 0, 255});
-    DrawText("SPPG", cardX + 22, cardY + 78, 11, BLACK);
-    DrawText("Dapur Pusat MBG (Titik Awal)", cardX + 70, cardY + 78, 12, (Color){255, 220, 140, 255});
+    DrawTextCustom("SPPG", cardX + 22, cardY + 78, 10.5f, BLACK, FONT_BOLD);
+    DrawTextCustom("Dapur Pusat MBG (Titik Awal)", cardX + 70, cardY + 78, 11.5f, (Color){255, 220, 140, 255}, FONT_REGULAR);
 
     int rowY = cardY + 100;
     for (size_t i = 0; i < m_schools.size(); i++) {
@@ -929,112 +1068,409 @@ void PathfinderState::DrawUI() {
 
         // Colored badge
         DrawRectangleRounded((Rectangle){(float)cardX + 16, (float)rowY, 24, 18}, 0.3f, 4, sch.color);
-        DrawText(TextFormat("%d", (int)i + 1), cardX + 24, rowY + 2, 12, WHITE);
+        DrawTextCustom(TextFormat("%d", (int)i + 1), cardX + 24, rowY + 2, 11, WHITE, FONT_BOLD);
 
         // Status string
-        const char* statusStr = isDone ? "✓ Selesai" : (isCurrent ? (m_isUnloading ? "🍱 Bongkar" : "▶ Menuju") : "Menunggu");
+        const char* statusStr = isDone ? "Selesai" : (isCurrent ? (m_isUnloading ? "Bongkar" : "▶ Menuju") : "Menunggu");
         Color statusColor = isDone ? (Color){100, 240, 130, 255} : (isCurrent ? YELLOW : (Color){180, 190, 205, 255});
 
         float legMeters = (i < m_routeLegs.size()) ? (m_routeLegs[i].path.totalDistanceWorld * 4.0f) : 0.0f;
-        DrawText(TextFormat("%s • [%d-%dm] • %.0fm • %s", sch.name.c_str(), sch.window.start, sch.window.end, legMeters, statusStr),
-                 cardX + 46, rowY + 2, 12, statusColor);
+        DrawTextCustom(TextFormat("%s • [%d-%dm] • %.0fm • %s", sch.name.c_str(), sch.window.start, sch.window.end, legMeters, statusStr),
+                       cardX + 46, rowY + 2, 11.5f, statusColor, FONT_REGULAR);
 
         rowY += 21;
     }
 
     // Final Step (Kembali ke SPPG)
     bool isReturnLegCurrent = isReturningToDepot && !m_allDelivered;
-    const char* returnStatusStr = m_allDelivered ? "✓ Tiba di SPPG" : (isReturnLegCurrent ? "▶ Sedang Kembali" : "Menunggu");
+    const char* returnStatusStr = m_allDelivered ? "Tiba di SPPG" : (isReturnLegCurrent ? "▶ Sedang Kembali" : "Menunggu");
     Color returnStatusCol = m_allDelivered ? (Color){100, 240, 130, 255} : (isReturnLegCurrent ? (Color){255, 220, 120, 255} : (Color){180, 190, 205, 255});
 
     float returnMeters = (!m_routeLegs.empty() && m_routeLegs.back().isReturnToDepot) ?
                          (m_routeLegs.back().path.totalDistanceWorld * 4.0f) : 0.0f;
 
     DrawRectangleRounded((Rectangle){(float)cardX + 16, (float)rowY, 24, 18}, 0.3f, 4, (Color){255, 180, 0, 255});
-    DrawText("⌂", cardX + 22, rowY + 2, 12, BLACK);
-    DrawText(TextFormat("Kembali ke SPPG (Titik Awal) • %.0fm • %s", returnMeters, returnStatusStr),
-             cardX + 46, rowY + 2, 12, returnStatusCol);
+    DrawTextCustom("0", cardX + 24, rowY + 2, 11, BLACK, FONT_BOLD);
+    DrawTextCustom(TextFormat("Kembali ke SPPG (Titik Awal) • %.0fm • %s", returnMeters, returnStatusStr),
+                   cardX + 46, rowY + 2, 11.5f, returnStatusCol, FONT_REGULAR);
 
     // Performance & Metrics summary
     DrawLine(cardX + 16, cardY + cardH - 58, cardX + cardW - 16, cardY + cardH - 58, Fade(WHITE, 0.15f));
 
-    DrawText(TextFormat("Total Cost: %d menit • Total Jarak: %.1f m", m_totalCostMinutes, m_totalRouteDistance * 4.0f),
-             cardX + 16, cardY + cardH - 46, 12, WHITE);
+    DrawTextCustom(TextFormat("Total Cost: %d menit • Total Jarak: %.1f m", m_totalCostMinutes, m_totalRouteDistance * 4.0f),
+                   cardX + 16, cardY + cardH - 46, 11.5f, WHITE, FONT_SEMIBOLD);
 
-    DrawText(TextFormat("States Explored: %d • Runtime: %.1f µs", m_statesExplored, m_optimizationTimeUs),
-             cardX + 16, cardY + cardH - 26, 12, (Color){140, 230, 255, 255});
+    DrawTextCustom(TextFormat("States Explored: %d • Runtime: %.1f µs", m_statesExplored, m_optimizationTimeUs),
+                   cardX + 16, cardY + cardH - 26, 11.5f, (Color){140, 230, 255, 255}, FONT_REGULAR);
 
     // =========================================================================
-    // 4. Real-Time 2D Minimap Overlay (Google Maps Style)
-    // Shows all legs color-coded on the map
+    // 4. Real-Time 2D Minimap & Fullscreen Map Overlay
     // =========================================================================
-    if (m_showMinimap && m_world.GetMapTexture().id != 0) {
-        Texture2D mapTex = m_world.GetMapTexture();
-        int mmW = 310;
-        int mmH = (int)(mmW * ((float)m_world.GetGridHeight() / m_world.GetGridWidth()));
-        int mmX = screenW - mmW - 16;
-        int mmY = screenH - mmH - 16;
+    if (m_showMinimap && !m_mapFullscreen) {
+        DrawMinimap(screenW, screenH);
+    }
 
-        DrawRectangleRounded((Rectangle){(float)mmX - 4, (float)mmY - 26, (float)mmW + 8, (float)mmH + 30}, 0.05f, 4, Fade(BLACK, 0.88f));
-        DrawRectangleRoundedLinesEx((Rectangle){(float)mmX - 4, (float)mmY - 26, (float)mmW + 8, (float)mmH + 30}, 0.05f, 4, 1.5f, Fade(WHITE, 0.3f));
-        DrawText("Peta Distribusi Rute MBG", mmX + 6, mmY - 20, 13, WHITE);
-
-        // Map Image Texture
-        DrawTexturePro(mapTex,
-                       (Rectangle){0.0f, 0.0f, (float)mapTex.width, (float)mapTex.height},
-                       (Rectangle){(float)mmX, (float)mmY, (float)mmW, (float)mmH},
-                       (Vector2){0, 0}, 0.0f, WHITE);
-
-        // Draw each colored route leg on the minimap
-        for (const auto& leg : m_routeLegs) {
-            if (!leg.path.found || leg.path.gridPath.size() < 2) continue;
-
-            // White underlay border
-            for (size_t i = 1; i < leg.path.gridPath.size(); i++) {
-                float x1 = mmX + (leg.path.gridPath[i - 1].x / m_world.GetGridWidth()) * mmW;
-                float y1 = mmY + (leg.path.gridPath[i - 1].y / m_world.GetGridHeight()) * mmH;
-                float x2 = mmX + (leg.path.gridPath[i].x / m_world.GetGridWidth()) * mmW;
-                float y2 = mmY + (leg.path.gridPath[i].y / m_world.GetGridHeight()) * mmH;
-                DrawLineEx((Vector2){x1, y1}, (Vector2){x2, y2}, 4.5f, WHITE);
-            }
-            // Leg colored line
-            for (size_t i = 1; i < leg.path.gridPath.size(); i++) {
-                float x1 = mmX + (leg.path.gridPath[i - 1].x / m_world.GetGridWidth()) * mmW;
-                float y1 = mmY + (leg.path.gridPath[i - 1].y / m_world.GetGridHeight()) * mmH;
-                float x2 = mmX + (leg.path.gridPath[i].x / m_world.GetGridWidth()) * mmW;
-                float y2 = mmY + (leg.path.gridPath[i].y / m_world.GetGridHeight()) * mmH;
-                DrawLineEx((Vector2){x1, y1}, (Vector2){x2, y2}, 3.0f, leg.color);
-            }
-        }
-
-        // Draw SPPG Pin (Dapur Pusat) on minimap
-        float sppgMMX = mmX + (m_carStartGridPos.x / m_world.GetGridWidth()) * mmW;
-        float sppgMMY = mmY + (m_carStartGridPos.y / m_world.GetGridHeight()) * mmH;
-        DrawCircle((int)sppgMMX, (int)sppgMMY, 8, (Color){255, 180, 0, 255});
-        DrawCircle((int)sppgMMX, (int)sppgMMY, 4, WHITE);
-        DrawText("SPPG", (int)sppgMMX - 10, (int)sppgMMY - 14, 9, (Color){255, 230, 100, 255});
-
-        // Draw all school pins on minimap
-        for (size_t i = 0; i < m_schools.size(); i++) {
-            const auto& sch = m_schools[i];
-            float schMMX = mmX + (sch.gridPos.x / m_world.GetGridWidth()) * mmW;
-            float schMMY = mmY + (sch.gridPos.y / m_world.GetGridHeight()) * mmH;
-
-            DrawCircle((int)schMMX, (int)schMMY, 7, sch.color);
-            DrawCircle((int)schMMX, (int)schMMY, 3, WHITE);
-            DrawText(TextFormat("%d", (int)i + 1), (int)schMMX - 2, (int)schMMY - 12, 10, WHITE);
-        }
-
-        // Draw car current position on minimap
-        Vector2 curCarGrid = m_world.WorldToGrid(m_carCurrentPos);
-        float carMMX = mmX + (curCarGrid.x / m_world.GetGridWidth()) * mmW;
-        float carMMY = mmY + (curCarGrid.y / m_world.GetGridHeight()) * mmH;
-
-        DrawCircle((int)carMMX, (int)carMMY, 8 + 3 * sinf(m_pulseTimer * 5.0f), Fade(curHeaderBg, 0.5f));
-        DrawCircle((int)carMMX, (int)carMMY, 5, WHITE);
-        DrawCircle((int)carMMX, (int)carMMY, 3, RED);
+    if (m_mapFullscreen) {
+        DrawFullscreenMap(screenW, screenH);
     }
 
     // Top Right FPS & Engine info
     Fumbo::Instance().DrawFPS(screenW - 105, 16);
+}
+
+void PathfinderState::DrawMinimap(int screenW, int screenH) {
+    if (m_world.GetMapTexture().id == 0) return;
+
+    Texture2D mapTex = m_world.GetMapTexture();
+    float mmW = m_minimapWidth;
+    float aspect = (float)m_world.GetGridHeight() / (float)m_world.GetGridWidth();
+    float mmH = mmW * aspect;
+    float mmX = (float)screenW - mmW - 16.0f;
+    float mmY = (float)screenH - mmH - 16.0f;
+
+    // Interactive resizing via mouse wheel hover over minimap
+    Vector2 mouse = GetMousePosition();
+    Rectangle mmBox = {mmX - 6.0f, mmY - 30.0f, mmW + 12.0f, mmH + 36.0f};
+    if (CheckCollisionPointRec(mouse, mmBox)) {
+        float wheel = GetMouseWheelMove();
+        if (wheel != 0.0f) {
+            m_minimapWidth = std::clamp(m_minimapWidth + wheel * 30.0f, 240.0f, 650.0f);
+            mmW = m_minimapWidth;
+            mmH = mmW * aspect;
+            mmX = (float)screenW - mmW - 16.0f;
+            mmY = (float)screenH - mmH - 16.0f;
+        }
+    }
+
+    // Outer card container
+    DrawRectangleRounded((Rectangle){mmX - 4.0f, mmY - 28.0f, mmW + 8.0f, mmH + 34.0f}, 0.04f, 4, Fade(BLACK, 0.90f));
+    DrawRectangleRoundedLinesEx((Rectangle){mmX - 4.0f, mmY - 28.0f, mmW + 8.0f, mmH + 34.0f}, 0.04f, 4, 1.5f, Fade(WHITE, 0.35f));
+
+    // Header label
+    DrawTextCustom("Peta MBG (Scroll: Resize)", mmX + 6.0f, mmY - 22.0f, 11.5f, WHITE, FONT_SEMIBOLD);
+
+    // Header control buttons: [-], [+], and [Fullscreen / Full]
+    Rectangle btnMinusRect = {mmX + mmW - 80.0f, mmY - 25.0f, 22.0f, 18.0f};
+    Rectangle btnPlusRect  = {mmX + mmW - 54.0f, mmY - 25.0f, 22.0f, 18.0f};
+    Rectangle btnFullRect  = {mmX + mmW - 28.0f, mmY - 25.0f, 28.0f, 18.0f};
+
+    bool hoverMinus = CheckCollisionPointRec(mouse, btnMinusRect);
+    bool hoverPlus  = CheckCollisionPointRec(mouse, btnPlusRect);
+    bool hoverFull  = CheckCollisionPointRec(mouse, btnFullRect);
+
+    DrawRectangleRounded(btnMinusRect, 0.25f, 2, hoverMinus ? (Color){100, 115, 140, 255} : (Color){50, 60, 75, 255});
+    DrawTextCustom("-", btnMinusRect.x + 8, btnMinusRect.y + 1, 12, WHITE, FONT_BOLD);
+
+    DrawRectangleRounded(btnPlusRect, 0.25f, 2, hoverPlus ? (Color){100, 115, 140, 255} : (Color){50, 60, 75, 255});
+    DrawTextCustom("+", btnPlusRect.x + 6, btnPlusRect.y + 1, 12, WHITE, FONT_BOLD);
+
+    DrawRectangleRounded(btnFullRect, 0.25f, 2, hoverFull ? (Color){30, 144, 255, 255} : (Color){20, 95, 190, 255});
+    DrawTextCustom("Full", btnFullRect.x + 4, btnFullRect.y + 2, 9.5f, WHITE, FONT_BOLD);
+
+    if (hoverMinus && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
+        m_minimapWidth = std::clamp(m_minimapWidth - 40.0f, 240.0f, 650.0f);
+    }
+    if (hoverPlus && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
+        m_minimapWidth = std::clamp(m_minimapWidth + 40.0f, 240.0f, 650.0f);
+    }
+    if (hoverFull && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
+        m_mapFullscreen = true;
+    }
+
+    // Map Image Texture
+    DrawTexturePro(mapTex,
+                   (Rectangle){0.0f, 0.0f, (float)mapTex.width, (float)mapTex.height},
+                   (Rectangle){mmX, mmY, mmW, mmH},
+                   (Vector2){0, 0}, 0.0f, WHITE);
+
+    // Draw each colored route leg on the minimap
+    for (const auto& leg : m_routeLegs) {
+        if (!leg.path.found || leg.path.gridPath.size() < 2) continue;
+
+        // White underlay border
+        for (size_t i = 1; i < leg.path.gridPath.size(); i++) {
+            float x1 = mmX + (leg.path.gridPath[i - 1].x / (float)m_world.GetGridWidth()) * mmW;
+            float y1 = mmY + (leg.path.gridPath[i - 1].y / (float)m_world.GetGridHeight()) * mmH;
+            float x2 = mmX + (leg.path.gridPath[i].x / (float)m_world.GetGridWidth()) * mmW;
+            float y2 = mmY + (leg.path.gridPath[i].y / (float)m_world.GetGridHeight()) * mmH;
+            DrawLineEx((Vector2){x1, y1}, (Vector2){x2, y2}, 4.0f, WHITE);
+        }
+        // Leg colored line
+        for (size_t i = 1; i < leg.path.gridPath.size(); i++) {
+            float x1 = mmX + (leg.path.gridPath[i - 1].x / (float)m_world.GetGridWidth()) * mmW;
+            float y1 = mmY + (leg.path.gridPath[i - 1].y / (float)m_world.GetGridHeight()) * mmH;
+            float x2 = mmX + (leg.path.gridPath[i].x / (float)m_world.GetGridWidth()) * mmW;
+            float y2 = mmY + (leg.path.gridPath[i].y / (float)m_world.GetGridHeight()) * mmH;
+            DrawLineEx((Vector2){x1, y1}, (Vector2){x2, y2}, 2.6f, leg.color);
+        }
+    }
+
+    // Draw SPPG Pin (Dapur Pusat) on minimap
+    float sppgMMX = mmX + (m_carStartGridPos.x / (float)m_world.GetGridWidth()) * mmW;
+    float sppgMMY = mmY + (m_carStartGridPos.y / (float)m_world.GetGridHeight()) * mmH;
+    DrawCircle((int)sppgMMX, (int)sppgMMY, 8, (Color){255, 180, 0, 255});
+    DrawCircle((int)sppgMMX, (int)sppgMMY, 4, WHITE);
+    DrawTextCustom("SPPG", (int)sppgMMX - 12, (int)sppgMMY - 14, 9, (Color){255, 230, 100, 255}, FONT_BOLD);
+
+    // Draw all school pins on minimap
+    for (size_t i = 0; i < m_schools.size(); i++) {
+        const auto& sch = m_schools[i];
+        float schMMX = mmX + (sch.gridPos.x / (float)m_world.GetGridWidth()) * mmW;
+        float schMMY = mmY + (sch.gridPos.y / (float)m_world.GetGridHeight()) * mmH;
+
+        DrawCircle((int)schMMX, (int)schMMY, 7, sch.color);
+        DrawCircle((int)schMMX, (int)schMMY, 3, WHITE);
+        DrawTextCustom(TextFormat("%d", (int)i + 1), (int)schMMX - 3, (int)schMMY - 12, 10, WHITE, FONT_BOLD);
+    }
+
+    // Draw car current position on minimap
+    Vector2 curCarGrid = m_world.WorldToGrid(m_carCurrentPos);
+    float carMMX = mmX + (curCarGrid.x / (float)m_world.GetGridWidth()) * mmW;
+    float carMMY = mmY + (curCarGrid.y / (float)m_world.GetGridHeight()) * mmH;
+
+    DrawCircle((int)carMMX, (int)carMMY, 8 + 3 * sinf(m_pulseTimer * 5.0f), Fade(RED, 0.5f));
+    DrawCircle((int)carMMX, (int)carMMY, 5, WHITE);
+    DrawCircle((int)carMMX, (int)carMMY, 3, RED);
+}
+
+void PathfinderState::DrawFullscreenMap(int screenW, int screenH) {
+    if (m_world.GetMapTexture().id == 0) return;
+
+    Texture2D mapTex = m_world.GetMapTexture();
+
+    // 1. Dark semi-transparent backdrop over entire screen
+    DrawRectangle(0, 0, screenW, screenH, Fade(BLACK, 0.88f));
+
+    // 2. Fullscreen Modal Frame (centered with margin)
+    int marginX = 28;
+    int marginY = 18;
+    int modalW = screenW - marginX * 2;
+    int modalH = screenH - marginY * 2;
+    int modalX = marginX;
+    int modalY = marginY;
+
+    // Modal Background & Border
+    DrawRectangleRounded((Rectangle){(float)modalX, (float)modalY, (float)modalW, (float)modalH}, 0.02f, 6, (Color){18, 22, 32, 255});
+    DrawRectangleRoundedLinesEx((Rectangle){(float)modalX, (float)modalY, (float)modalW, (float)modalH}, 0.02f, 6, 2.0f, (Color){45, 125, 235, 200});
+
+    // 3. Header Bar
+    DrawRectangle((float)modalX + 2, (float)modalY + 2, (float)modalW - 4, 48, (Color){28, 35, 50, 255});
+    DrawLine(modalX + 16, modalY + 50, modalX + modalW - 16, modalY + 50, Fade(WHITE, 0.2f));
+
+    DrawTextCustom("PETA DISTRIBUSI RUTE MBG (RESOLUSI PENUH)", modalX + 18, modalY + 11, 15, WHITE, FONT_BOLD);
+    DrawTextCustom(TextFormat("Resolusi Asli: %dx%d • Zoom: %.1fx • Scroll: Zoom • Drag: Geser Peta",
+                              mapTex.width, mapTex.height, m_mapZoom),
+                   modalX + 18, modalY + 31, 11, (Color){160, 205, 250, 255}, FONT_REGULAR);
+
+    // Header Buttons: Reset Zoom & Close
+    Vector2 mouse = GetMousePosition();
+
+    Rectangle btnResetRect = {(float)modalX + modalW - 250, (float)modalY + 10, 120, 30};
+    Rectangle btnCloseRect = {(float)modalX + modalW - 120, (float)modalY + 10, 105, 30};
+
+    bool hoverReset = CheckCollisionPointRec(mouse, btnResetRect);
+    bool hoverClose = CheckCollisionPointRec(mouse, btnCloseRect);
+
+    DrawRectangleRounded(btnResetRect, 0.25f, 4, hoverReset ? (Color){60, 80, 110, 255} : (Color){40, 50, 70, 255});
+    DrawRectangleRoundedLinesEx(btnResetRect, 0.25f, 4, 1.2f, Fade(WHITE, 0.3f));
+    DrawTextCustom("100% Reset Zoom", btnResetRect.x + 12, btnResetRect.y + 7, 11, WHITE, FONT_SEMIBOLD);
+
+    DrawRectangleRounded(btnCloseRect, 0.25f, 4, hoverClose ? (Color){220, 50, 50, 255} : (Color){180, 40, 40, 255});
+    DrawRectangleRoundedLinesEx(btnCloseRect, 0.25f, 4, 1.2f, Fade(WHITE, 0.4f));
+    DrawTextCustom("Tutup [ESC/M]", btnCloseRect.x + 12, btnCloseRect.y + 7, 11, WHITE, FONT_BOLD);
+
+    if (hoverReset && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
+        m_mapZoom = 1.0f;
+        m_mapPan = {0, 0};
+    }
+    if (hoverClose && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
+        m_mapFullscreen = false;
+        m_mapZoom = 1.0f;
+        m_mapPan = {0, 0};
+    }
+
+    // 4. Map Viewport inside modal
+    int viewX = modalX + 14;
+    int viewY = modalY + 54;
+    int viewW = modalW - 28;
+    int viewH = modalH - 108; // Leaves space for bottom legend bar
+
+    DrawRectangle(viewX, viewY, viewW, viewH, (Color){10, 12, 18, 255});
+
+    // Compute base dimensions preserving map aspect ratio
+    float mapAspect = (float)m_world.GetGridWidth() / (float)m_world.GetGridHeight();
+    float viewAspect = (float)viewW / (float)viewH;
+    float baseW, baseH;
+    if (viewAspect > mapAspect) {
+        baseH = (float)viewH;
+        baseW = baseH * mapAspect;
+    } else {
+        baseW = (float)viewW;
+        baseH = baseW / mapAspect;
+    }
+
+    float cx = (float)viewX + (float)viewW * 0.5f;
+    float cy = (float)viewY + (float)viewH * 0.5f;
+    float curW = baseW * m_mapZoom;
+    float curH = baseH * m_mapZoom;
+    float mapLeft = cx - curW * 0.5f + m_mapPan.x;
+    float mapTop  = cy - curH * 0.5f + m_mapPan.y;
+
+    // Viewport mouse interactions: Zoom & Pan
+    Rectangle viewRec = {(float)viewX, (float)viewY, (float)viewW, (float)viewH};
+    if (CheckCollisionPointRec(mouse, viewRec)) {
+        float wheel = GetMouseWheelMove();
+        if (wheel != 0.0f) {
+            float oldZoom = m_mapZoom;
+            m_mapZoom = std::clamp(m_mapZoom + wheel * 0.25f, 1.0f, 6.0f);
+            if (m_mapZoom <= 1.0f) {
+                m_mapZoom = 1.0f;
+                m_mapPan = {0, 0};
+            } else {
+                float ratio = m_mapZoom / oldZoom;
+                m_mapPan.x = (m_mapPan.x - (mouse.x - cx)) * ratio + (mouse.x - cx);
+                m_mapPan.y = (m_mapPan.y - (mouse.y - cy)) * ratio + (mouse.y - cy);
+            }
+        }
+
+        if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT) || IsMouseButtonPressed(MOUSE_BUTTON_RIGHT)) {
+            m_isPanningMap = true;
+            m_panStartMouse = mouse;
+            m_panStartOffset = m_mapPan;
+        }
+    }
+
+    if (m_isPanningMap) {
+        if (IsMouseButtonDown(MOUSE_BUTTON_LEFT) || IsMouseButtonDown(MOUSE_BUTTON_RIGHT)) {
+            m_mapPan.x = m_panStartOffset.x + (mouse.x - m_panStartMouse.x);
+            m_mapPan.y = m_panStartOffset.y + (mouse.y - m_panStartMouse.y);
+        } else {
+            m_isPanningMap = false;
+        }
+    }
+
+    // 5. Scissor mode: Clip map rendering inside viewport
+    BeginScissorMode(viewX, viewY, viewW, viewH);
+
+    // Draw Map Texture
+    DrawTexturePro(mapTex,
+                   (Rectangle){0.0f, 0.0f, (float)mapTex.width, (float)mapTex.height},
+                   (Rectangle){mapLeft, mapTop, curW, curH},
+                   (Vector2){0, 0}, 0.0f, WHITE);
+
+    auto g2s = [&](Vector2 gp) -> Vector2 {
+        return (Vector2){
+            mapLeft + (gp.x / (float)m_world.GetGridWidth()) * curW,
+            mapTop  + (gp.y / (float)m_world.GetGridHeight()) * curH
+        };
+    };
+
+    // Draw Route Lines with dynamic thickness based on zoom
+    float underWidth = std::clamp(6.0f * sqrtf(m_mapZoom), 5.0f, 14.0f);
+    float coreWidth  = std::clamp(3.5f * sqrtf(m_mapZoom), 3.0f, 9.0f);
+
+    for (const auto& leg : m_routeLegs) {
+        if (!leg.path.found || leg.path.gridPath.size() < 2) continue;
+
+        // White underlay border
+        for (size_t i = 1; i < leg.path.gridPath.size(); i++) {
+            Vector2 p1 = g2s(leg.path.gridPath[i - 1]);
+            Vector2 p2 = g2s(leg.path.gridPath[i]);
+            DrawLineEx(p1, p2, underWidth, WHITE);
+        }
+
+        // Core colored leg ribbon
+        for (size_t i = 1; i < leg.path.gridPath.size(); i++) {
+            Vector2 p1 = g2s(leg.path.gridPath[i - 1]);
+            Vector2 p2 = g2s(leg.path.gridPath[i]);
+            DrawLineEx(p1, p2, coreWidth, leg.color);
+        }
+    }
+
+    // Draw SPPG Depot (Dapur Pusat) Pin & Label
+    Vector2 sppgPos = g2s(m_carStartGridPos);
+    DrawCircle((int)sppgPos.x, (int)sppgPos.y, 14, (Color){255, 180, 0, 255});
+    DrawCircle((int)sppgPos.x, (int)sppgPos.y, 9, WHITE);
+    DrawCircle((int)sppgPos.x, (int)sppgPos.y, 5, (Color){220, 140, 0, 255});
+
+    const char* sppgLabel = "SPPG (Dapur Pusat MBG)";
+    float sppgLblW = MeasureTextCustom(sppgLabel, 11, FONT_BOLD) + 14;
+    DrawRectangleRounded((Rectangle){sppgPos.x - sppgLblW * 0.5f, sppgPos.y - 34, sppgLblW, 20}, 0.3f, 4, Fade(BLACK, 0.88f));
+    DrawRectangleRoundedLinesEx((Rectangle){sppgPos.x - sppgLblW * 0.5f, sppgPos.y - 34, sppgLblW, 20}, 0.3f, 4, 1.2f, (Color){255, 190, 0, 255});
+    DrawTextCustom(sppgLabel, sppgPos.x - sppgLblW * 0.5f + 7, sppgPos.y - 30, 11, (Color){255, 230, 100, 255}, FONT_BOLD);
+
+    // Draw School Pins with full informational floating pills
+    for (size_t i = 0; i < m_schools.size(); i++) {
+        const auto& sch = m_schools[i];
+        Vector2 schPos = g2s(sch.gridPos);
+
+        DrawCircle((int)schPos.x, (int)schPos.y, 13, sch.color);
+        DrawCircle((int)schPos.x, (int)schPos.y, 7, WHITE);
+        DrawTextCustom(TextFormat("%d", (int)i + 1), schPos.x - 4, schPos.y - 7, 12, BLACK, FONT_BOLD);
+
+        // Floating pill: Stop #, School Name, Window
+        const char* infoText = TextFormat("Stop %d: %s [%d-%dm]", (int)i + 1, sch.name.c_str(), sch.window.start, sch.window.end);
+        float sW = MeasureTextCustom(infoText, 10.5f, FONT_SEMIBOLD) + 14;
+        DrawRectangleRounded((Rectangle){schPos.x - sW * 0.5f, schPos.y - 32, sW, 19}, 0.3f, 4, Fade(BLACK, 0.88f));
+        DrawRectangleRoundedLinesEx((Rectangle){schPos.x - sW * 0.5f, schPos.y - 32, sW, 19}, 0.3f, 4, 1.2f, sch.color);
+        DrawTextCustom(infoText, schPos.x - sW * 0.5f + 7, schPos.y - 29, 10.5f, WHITE, FONT_SEMIBOLD);
+    }
+
+    // Draw Delivery Car on map
+    Vector2 curCarGrid = m_world.WorldToGrid(m_carCurrentPos);
+    Vector2 carPos = g2s(curCarGrid);
+
+    DrawCircle((int)carPos.x, (int)carPos.y, 16 + 5 * sinf(m_pulseTimer * 6.0f), Fade(RED, 0.4f));
+    DrawCircle((int)carPos.x, (int)carPos.y, 10, WHITE);
+    DrawCircle((int)carPos.x, (int)carPos.y, 6, RED);
+
+    // Direction arrow
+    Vector2 arrowTip = {
+        carPos.x + sinf(m_carHeading) * 18.0f,
+        carPos.y + cosf(m_carHeading) * 18.0f
+    };
+    DrawLineEx(carPos, arrowTip, 3.2f, (Color){255, 230, 0, 255});
+    DrawCircle((int)arrowTip.x, (int)arrowTip.y, 3.5f, (Color){255, 230, 0, 255});
+
+    EndScissorMode();
+
+    // 6. Bottom Legend & Sequence Bar
+    int barY = viewY + viewH + 6;
+    int barH = modalH - (barY - modalY) - 8;
+    DrawRectangleRounded((Rectangle){(float)viewX, (float)barY, (float)viewW, (float)barH}, 0.15f, 4, (Color){24, 30, 44, 255});
+    DrawRectangleRoundedLinesEx((Rectangle){(float)viewX, (float)barY, (float)viewW, (float)barH}, 0.15f, 4, 1.0f, Fade(WHITE, 0.2f));
+
+    DrawTextCustom("Urutan:", viewX + 14, barY + 8, 11, LIGHTGRAY, FONT_SEMIBOLD);
+
+    int legX = viewX + 68;
+    // SPPG badge
+    DrawRectangleRounded((Rectangle){(float)legX, (float)barY + 6, 44, 18}, 0.3f, 4, (Color){255, 180, 0, 255});
+    DrawTextCustom("SPPG", legX + 6, barY + 8, 9.5f, BLACK, FONT_BOLD);
+    legX += 50;
+
+    for (size_t i = 0; i < m_schools.size(); i++) {
+        DrawTextCustom("→", legX, barY + 7, 12, WHITE, FONT_BOLD);
+        legX += 16;
+
+        const auto& sch = m_schools[i];
+        DrawRectangleRounded((Rectangle){(float)legX, (float)barY + 6, 22, 18}, 0.3f, 4, sch.color);
+        DrawTextCustom(TextFormat("%d", (int)i + 1), legX + 7, barY + 8, 10, WHITE, FONT_BOLD);
+        legX += 28;
+
+        DrawTextCustom(sch.name.c_str(), legX, barY + 8, 11, WHITE, FONT_REGULAR);
+        legX += MeasureTextCustom(sch.name.c_str(), 11, FONT_REGULAR) + 12;
+    }
+
+    DrawTextCustom("→", legX, barY + 7, 12, WHITE, FONT_BOLD);
+    legX += 16;
+    DrawRectangleRounded((Rectangle){(float)legX, (float)barY + 6, 80, 18}, 0.3f, 4, (Color){255, 180, 0, 255});
+    DrawTextCustom("Kembali SPPG", legX + 5, barY + 8, 9.5f, BLACK, FONT_BOLD);
+
+    // Right summary metrics
+    const char* sumStr = TextFormat("Total: %.1f m • Cost: %d mnt • %s",
+                                    m_totalRouteDistance * 4.0f,
+                                    m_totalCostMinutes,
+                                    m_routeFeasible ? "Layak (Feasible)" : "Overdue");
+    float sumW = MeasureTextCustom(sumStr, 11, FONT_SEMIBOLD);
+    DrawTextCustom(sumStr, viewX + viewW - sumW - 16, barY + 8, 11, (Color){140, 230, 255, 255}, FONT_SEMIBOLD);
 }

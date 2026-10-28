@@ -1,0 +1,8 @@
+Model Information:
+* title:	Low poly camping tent 3
+* source:	https://sketchfab.com/3d-models/low-poly-camping-tent-3-4f814fe5b4424303994d05f1997f674e
+* author:	assetfactory (https://sketchfab.com/assetfactory)
+
+Model License:
+* license type:	SKETCHFAB Standard (https://sketchfab.com/licenses)
+* requirements:	Under basic restrictions, use worldwide, on all types of media, commercially or not, and in all types of derivative works

@@ -130,8 +130,31 @@ private:
     bool m_showLidar = true;
     std::vector<RayHitResult> m_lidarHits;
 
-    // UI state
+    // UI state & Map View
     bool m_showMinimap = true;
+    bool m_mapFullscreen = false;
+    float m_minimapWidth = 320.0f; // Resizable minimap width (240px - 650px)
+    float m_mapZoom = 1.0f;        // Fullscreen zoom factor (1.0x - 5.0x)
+    Vector2 m_mapPan = {0, 0};     // Fullscreen pan offset
+    bool m_isPanningMap = false;
+    Vector2 m_panStartMouse = {0, 0};
+    Vector2 m_panStartOffset = {0, 0};
+
+    // Typography: Montserrat Font Family from assets/fonts
+    enum FontStyle {
+        FONT_REGULAR = 0,
+        FONT_SEMIBOLD,
+        FONT_BOLD
+    };
+    Font m_fontBold = {0};
+    Font m_fontSemiBold = {0};
+    Font m_fontRegular = {0};
+    bool m_fontsLoaded = false;
+
+    void LoadFonts();
+    void UnloadFonts();
+    void DrawTextCustom(const char* text, float x, float y, float size, Color color, FontStyle style = FONT_REGULAR) const;
+    float MeasureTextCustom(const char* text, float size, FontStyle style = FONT_REGULAR) const;
 
     // Internal actions
     void RandomizePositions();
@@ -141,4 +164,6 @@ private:
     void UpdateNavigationStatus();
     void UpdateCameraControls();
     void DrawUI();
+    void DrawMinimap(int screenW, int screenH);
+    void DrawFullscreenMap(int screenW, int screenH);
 };
