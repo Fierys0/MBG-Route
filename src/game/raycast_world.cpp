@@ -4,19 +4,84 @@
 #include <algorithm>
 #include <cstring>
 #include <cmath>
-#include <unordered_map>
 
 static const float GROUND_Y = 0.0f;
+static const float SHADOW_Y = 0.01f; // Just above ground for contact AO
 static const float ROAD_Y   = 0.02f;
 static const float RIVER_Y  = 0.015f;
 
 // User specified color references
 // jalan = #cdd1dc (205, 209, 220)
 // gedung = #f7f3f2 (247, 243, 242)
+static const Color BLD_BASE_COLOR = {247, 243, 242, 255};
+static const Color ROAD_COLOR     = {205, 209, 220, 255};
+static const Color RIVER_COLOR    = {66, 153, 225, 255};
+static const Color GROUND_COLOR   = {226, 228, 235, 255};
 
+// Helper: Calculate shaded color combining directional sunlight and ambient occlusion
+static inline Color CalcShadedColor(Color base, float lightFactor, float aoFactor) {
+    float totalFactor = lightFactor * aoFactor;
+    return (Color){
+        (unsigned char)std::clamp((int)(base.r * totalFactor), 0, 255),
+        (unsigned char)std::clamp((int)(base.g * totalFactor), 0, 255),
+        (unsigned char)std::clamp((int)(base.b * totalFactor), 0, 255),
+        255
+    };
+}
+
+// Push a double-sided quad with per-vertex colors for Ambient Occlusion
+static void PushQuadAO(std::vector<float>& verts, std::vector<float>& normals, std::vector<float>& uvs,
+                       std::vector<unsigned char>& colors,
+                       Vector3 p0, Vector3 p1, Vector3 p2, Vector3 p3,
+                       Vector3 normal,
+                       Color c0, Color c1, Color c2, Color c3) {
+    // Triangle 1 (p0, p1, p2)
+    verts.push_back(p0.x); verts.push_back(p0.y); verts.push_back(p0.z);
+    verts.push_back(p1.x); verts.push_back(p1.y); verts.push_back(p1.z);
+    verts.push_back(p2.x); verts.push_back(p2.y); verts.push_back(p2.z);
+
+    colors.push_back(c0.r); colors.push_back(c0.g); colors.push_back(c0.b); colors.push_back(c0.a);
+    colors.push_back(c1.r); colors.push_back(c1.g); colors.push_back(c1.b); colors.push_back(c1.a);
+    colors.push_back(c2.r); colors.push_back(c2.g); colors.push_back(c2.b); colors.push_back(c2.a);
+
+    // Triangle 2 (p0, p2, p3)
+    verts.push_back(p0.x); verts.push_back(p0.y); verts.push_back(p0.z);
+    verts.push_back(p2.x); verts.push_back(p2.y); verts.push_back(p2.z);
+    verts.push_back(p3.x); verts.push_back(p3.y); verts.push_back(p3.z);
+
+    colors.push_back(c0.r); colors.push_back(c0.g); colors.push_back(c0.b); colors.push_back(c0.a);
+    colors.push_back(c2.r); colors.push_back(c2.g); colors.push_back(c2.b); colors.push_back(c2.a);
+    colors.push_back(c3.r); colors.push_back(c3.g); colors.push_back(c3.b); colors.push_back(c3.a);
+
+    // Back face (reverse winding for 100% two-sided robustness)
+    verts.push_back(p0.x); verts.push_back(p0.y); verts.push_back(p0.z);
+    verts.push_back(p2.x); verts.push_back(p2.y); verts.push_back(p2.z);
+    verts.push_back(p1.x); verts.push_back(p1.y); verts.push_back(p1.z);
+
+    colors.push_back(c0.r); colors.push_back(c0.g); colors.push_back(c0.b); colors.push_back(c0.a);
+    colors.push_back(c2.r); colors.push_back(c2.g); colors.push_back(c2.b); colors.push_back(c2.a);
+    colors.push_back(c1.r); colors.push_back(c1.g); colors.push_back(c1.b); colors.push_back(c1.a);
+
+    verts.push_back(p0.x); verts.push_back(p0.y); verts.push_back(p0.z);
+    verts.push_back(p3.x); verts.push_back(p3.y); verts.push_back(p3.z);
+    verts.push_back(p2.x); verts.push_back(p2.y); verts.push_back(p2.z);
+
+    colors.push_back(c0.r); colors.push_back(c0.g); colors.push_back(c0.b); colors.push_back(c0.a);
+    colors.push_back(c3.r); colors.push_back(c3.g); colors.push_back(c3.b); colors.push_back(c3.a);
+    colors.push_back(c2.r); colors.push_back(c2.g); colors.push_back(c2.b); colors.push_back(c2.a);
+
+    for (int i = 0; i < 12; i++) {
+        normals.push_back(normal.x);
+        normals.push_back(normal.y);
+        normals.push_back(normal.z);
+        uvs.push_back(0.0f);
+        uvs.push_back(0.0f);
+    }
+}
+
+// Push a standard double-sided quad without per-vertex colors
 static void PushQuad(std::vector<float>& verts, std::vector<float>& normals, std::vector<float>& uvs,
                      Vector3 p0, Vector3 p1, Vector3 p2, Vector3 p3, Vector3 normal) {
-    // Front face
     verts.push_back(p0.x); verts.push_back(p0.y); verts.push_back(p0.z);
     verts.push_back(p1.x); verts.push_back(p1.y); verts.push_back(p1.z);
     verts.push_back(p2.x); verts.push_back(p2.y); verts.push_back(p2.z);
@@ -25,7 +90,6 @@ static void PushQuad(std::vector<float>& verts, std::vector<float>& normals, std
     verts.push_back(p2.x); verts.push_back(p2.y); verts.push_back(p2.z);
     verts.push_back(p3.x); verts.push_back(p3.y); verts.push_back(p3.z);
 
-    // Back face (reverse winding)
     verts.push_back(p0.x); verts.push_back(p0.y); verts.push_back(p0.z);
     verts.push_back(p2.x); verts.push_back(p2.y); verts.push_back(p2.z);
     verts.push_back(p1.x); verts.push_back(p1.y); verts.push_back(p1.z);
@@ -45,7 +109,8 @@ static void PushQuad(std::vector<float>& verts, std::vector<float>& normals, std
 
 static Model CreateModelFromBuffers(const std::vector<float>& verts,
                                     const std::vector<float>& normals,
-                                    const std::vector<float>& uvs) {
+                                    const std::vector<float>& uvs,
+                                    const std::vector<unsigned char>& colors = {}) {
     Mesh mesh = {0};
     if (verts.empty()) return LoadModelFromMesh(mesh);
 
@@ -60,6 +125,11 @@ static Model CreateModelFromBuffers(const std::vector<float>& verts,
     memcpy(mesh.normals, normals.data(), sizeof(float) * normals.size());
     memcpy(mesh.texcoords, uvs.data(), sizeof(float) * uvs.size());
 
+    if (!colors.empty()) {
+        mesh.colors = (unsigned char*)MemAlloc(sizeof(unsigned char) * colors.size());
+        memcpy(mesh.colors, colors.data(), sizeof(unsigned char) * colors.size());
+    }
+
     UploadMesh(&mesh, false);
     return LoadModelFromMesh(mesh);
 }
@@ -67,8 +137,9 @@ static Model CreateModelFromBuffers(const std::vector<float>& verts,
 RaycastWorld::RaycastWorld() {
     memset(&m_groundModel, 0, sizeof(Model));
     memset(&m_roadModel, 0, sizeof(Model));
-    memset(&m_grassModel, 0, sizeof(Model));
     memset(&m_riverModel, 0, sizeof(Model));
+    memset(&m_shadowModel, 0, sizeof(Model));
+    memset(&m_buildingModel, 0, sizeof(Model));
     memset(&m_mapTexture, 0, sizeof(Texture2D));
 }
 
@@ -77,25 +148,13 @@ RaycastWorld::~RaycastWorld() {
 }
 
 void RaycastWorld::Cleanup() {
-    if (m_flatModelsLoaded) {
+    if (m_modelsLoaded) {
         if (m_groundModel.meshCount > 0) UnloadModel(m_groundModel);
         if (m_roadModel.meshCount > 0) UnloadModel(m_roadModel);
-        if (m_grassModel.meshCount > 0) UnloadModel(m_grassModel);
         if (m_riverModel.meshCount > 0) UnloadModel(m_riverModel);
-        m_flatModelsLoaded = false;
-    }
-    // Cleanup instanced building prototypes
-    if (m_buildingsLoaded) {
-        for (auto& proto : m_buildingPrototypes) {
-            if (proto.uploaded) {
-                UnloadMesh(proto.mesh);
-                // Material is shared default, don't unload it multiple times
-            }
-            proto.transforms.clear();
-            proto.uploaded = false;
-        }
-        m_buildingPrototypes.clear();
-        m_buildingsLoaded = false;
+        if (m_shadowModel.meshCount > 0) UnloadModel(m_shadowModel);
+        if (m_buildingModel.meshCount > 0) UnloadModel(m_buildingModel);
+        m_modelsLoaded = false;
     }
     if (m_textureLoaded) {
         UnloadTexture(m_mapTexture);
@@ -117,8 +176,8 @@ MapTileType RaycastWorld::ClassifyPixelColor(Color c) const {
     float g = (float)c.g;
     float b = (float)c.b;
 
-    // 1. Sungai berwarna biru (#c2dde6 / #b5daea / dominant light blue)
-    if (b > 200.0f && (b - r > 20.0f) && (g - r > 10.0f)) {
+    // 1. Sungai berwarna biru (#c2dde6 / dominant blue)
+    if (b > 195.0f && (b - r > 18.0f) && (g - r > 8.0f)) {
         return TILE_RIVER;
     }
 
@@ -128,19 +187,13 @@ MapTileType RaycastWorld::ClassifyPixelColor(Color c) const {
     float db = b - 220.0f;
     float distRoad = sqrtf(dr * dr + dg * dg + db * db);
 
-    // Distance to exact building color #f7f3f2 (247, 243, 242)
-    float dbr = r - 247.0f;
-    float dbg = g - 243.0f;
-    float dbb = b - 242.0f;
-    float distBld = sqrtf(dbr * dbr + dbg * dbg + dbb * dbb);
-
     float meanB = (r + g + b) / 3.0f;
     float maxC = fmaxf(fmaxf(r, g), b);
     float minC = fminf(fminf(r, g), b);
     float diff = maxC - minC;
 
-    // Road check: close to #cdd1dc OR darker road lines (between 90 and 228 brightness, low saturation)
-    if (distRoad < 40.0f || (meanB >= 90.0f && meanB < 228.0f && diff < 28.0f)) {
+    // Road check: close to #cdd1dc OR road grey tones (between 90 and 228 brightness, low saturation)
+    if (distRoad < 42.0f || (meanB >= 90.0f && meanB < 228.0f && diff < 26.0f)) {
         return TILE_ROAD;
     }
 
@@ -216,14 +269,11 @@ bool RaycastWorld::GenerateFromImage(const char* imagePath, int downscaleFactor)
     // Group adjacent building cells into varied lots (different widths and heights)
     PartitionBuildingLots();
 
-    // Build flat surface meshes (ground, road, river) — still single merged model
-    BuildFlatSurfaceMeshes();
+    // Procedurally generate 3D meshes with baked ambient occlusion
+    BuildProceduralMeshes();
 
-    // Build GPU instanced building prototypes (~15 types, 1 draw call each!)
-    BuildInstancedBuildings();
-
-    TraceLog(LOG_INFO, "3D World successfully built: %dx%d cells, %d connected roads, %d building prototypes",
-             m_gridWidth, m_gridHeight, (int)m_mainRoadCells.size(), (int)m_buildingPrototypes.size());
+    TraceLog(LOG_INFO, "3D World built: %dx%d cells, %d roads, %d building lots",
+             m_gridWidth, m_gridHeight, (int)m_mainRoadCells.size(), (int)m_buildingLots.size());
     return true;
 }
 
@@ -291,7 +341,8 @@ void RaycastWorld::PartitionBuildingLots() {
     m_buildingLots.clear();
     std::vector<bool> assigned(m_gridWidth * m_gridHeight, false);
 
-    // Group adjacent building cells into diverse lots (different widths & depths: 3x2, 2x3, 2x2, 2x1, 1x2, 1x1)
+    // Group adjacent building cells into diverse lots (different widths & depths: 4x3, 3x3, 3x2, 2x3, 2x2, 2x1, 1x2, 1x1)
+    // Larger footprints represent realistic city compounds, commercial plazas, and skyscrapers
     for (int y = 0; y < m_gridHeight; y++) {
         for (int x = 0; x < m_gridWidth; x++) {
             int idx = y * m_gridWidth + x;
@@ -302,13 +353,13 @@ void RaycastWorld::PartitionBuildingLots() {
             unsigned int seed = (unsigned int)(x * 73856093 ^ y * 19349663);
             int pref = seed % 100;
 
-            const int candidates[6][2] = {
-                {3, 2}, {2, 3}, {2, 2}, {2, 1}, {1, 2}, {1, 1}
+            const int candidates[8][2] = {
+                {4, 3}, {3, 3}, {3, 2}, {2, 3}, {2, 2}, {2, 1}, {1, 2}, {1, 1}
             };
-            int candStart = (pref < 16) ? 0 : (pref < 42) ? 2 : (pref < 72) ? 3 : 5;
+            int candStart = (pref < 12) ? 0 : (pref < 25) ? 2 : (pref < 55) ? 4 : (pref < 80) ? 5 : 7;
 
             int bestW = 1, bestH = 1;
-            for (int c = candStart; c < 6; c++) {
+            for (int c = candStart; c < 8; c++) {
                 int lw = candidates[c][0];
                 int lh = candidates[c][1];
                 if (x + lw <= m_gridWidth && y + lh <= m_gridHeight) {
@@ -337,45 +388,78 @@ void RaycastWorld::PartitionBuildingLots() {
             }
 
             // Procedural diverse height based on district zone and lot size
+            // Creates 12-15 distinct architectural building categories
             float zone = (sinf((float)x * 0.045f) * cosf((float)y * 0.045f) + 1.0f) * 0.5f;
             float rnd = (float)(seed % 1000) / 1000.0f;
             float height = 0.8f;
+            int style = 0;
             bool hasPenthouse = false;
 
-            if (bestW * bestH >= 4) {
-                // Wide buildings (2x2, 3x2, 2x3)
+            int area = bestW * bestH;
+            if (area >= 9) {
+                // Grand Commercial Plazas / Supertall Headquarters (Category 1, 2, 3)
                 if (zone > 0.65f) {
-                    // Skyscraper / Corporate Tower
-                    height = 3.6f + rnd * 2.4f; // 3.6f to 6.0f tall!
+                    height = 4.8f + rnd * 2.4f; // 4.8m - 7.2m Landmark Skyscraper
+                    style = 1;
+                    hasPenthouse = true;
+                } else {
+                    height = 1.4f + rnd * 1.2f; // Shopping Mall / Exhibition Center
+                    style = 2;
+                }
+            } else if (area >= 6) {
+                // Wide Corporate Towers / Large Office Blocks (Category 4, 5, 6)
+                if (zone > 0.60f) {
+                    height = 3.8f + rnd * 2.2f; // 3.8m - 6.0m Office Tower
+                    style = 3;
                     hasPenthouse = true;
                 } else if (zone > 0.35f) {
-                    // Mid-rise Commercial Mall / Office
-                    height = 2.0f + rnd * 1.5f; // 2.0f to 3.5f
-                    if (height > 2.8f) hasPenthouse = true;
+                    height = 2.4f + rnd * 1.4f; // Mid-rise Business Complex
+                    style = 4;
+                    if (height > 3.2f) hasPenthouse = true;
                 } else {
-                    // Large Residential Complex / School campus
-                    height = 1.2f + rnd * 1.0f; // 1.2f to 2.2f
+                    height = 1.2f + rnd * 0.8f; // Large Residential / School Compound
+                    style = 5;
                 }
-            } else if (bestW * bestH >= 2) {
-                // Medium buildings (2x1, 1x2)
+            } else if (area >= 4) {
+                // Medium High-Rise / Apartment Blocks (Category 7, 8, 9)
                 if (zone > 0.70f) {
-                    height = 2.6f + rnd * 1.8f; // 2.6f to 4.4f
-                    if (height > 3.4f) hasPenthouse = true;
+                    height = 3.2f + rnd * 1.8f; // 3.2m - 5.0m Apartment Tower
+                    style = 6;
+                    hasPenthouse = true;
+                } else if (zone > 0.40f) {
+                    height = 2.0f + rnd * 1.2f; // 4-story Commercial Building
+                    style = 7;
                 } else {
-                    height = 1.3f + rnd * 1.2f; // 1.3f to 2.5f
+                    height = 1.1f + rnd * 0.7f; // Low-rise Condominium
+                    style = 8;
                 }
-            } else {
-                // 1x1 Compact Lots (Individual houses, shops)
-                if (rnd > 0.90f && zone > 0.75f) {
-                    height = 3.2f + rnd * 1.5f; // Occasional slender high spire
+            } else if (area >= 2) {
+                // Street Commercial / Two-story Shopfronts (Category 10, 11, 12)
+                if (zone > 0.75f && rnd > 0.65f) {
+                    height = 2.8f + rnd * 1.4f; // Slender Mid-rise Tower
+                    style = 9;
                     hasPenthouse = true;
                 } else {
-                    height = 0.75f + rnd * 0.75f; // 0.75f to 1.5f (low-rise houses)
+                    height = 1.2f + rnd * 1.0f; // 2-3 Story Shophouse (Ruko)
+                    style = 10;
+                }
+            } else {
+                // 1x1 Compact Lots: Suburban Houses & Neighborhood Stores (Category 13, 14, 15)
+                if (rnd > 0.92f && zone > 0.75f) {
+                    height = 3.0f + rnd * 1.5f; // Slender Modern Spire
+                    style = 11;
+                    hasPenthouse = true;
+                } else if (rnd > 0.50f) {
+                    height = 1.1f + rnd * 0.6f; // 2-Story Residential Villa
+                    style = 12;
+                } else {
+                    height = 0.75f + rnd * 0.5f; // Single-Story House
+                    style = 13;
                 }
             }
 
-            // Setback margin with slight variation per lot
-            float inset = m_cellWorldSize * (0.12f + 0.06f * (rnd * 0.5f));
+            // Setback margin ensuring buildings NEVER clip into roads or vehicles
+            float inset = m_cellWorldSize * (0.14f + 0.05f * rnd);
 
             BuildingLot lot;
             lot.x = x;
@@ -384,6 +468,7 @@ void RaycastWorld::PartitionBuildingLots() {
             lot.h = bestH;
             lot.height = height;
             lot.inset = inset;
+            lot.style = style;
             lot.hasPenthouse = hasPenthouse;
 
             m_buildingLots.push_back(lot);
@@ -399,283 +484,261 @@ void RaycastWorld::PartitionBuildingLots() {
 }
 
 // =========================================================================
-// BuildFlatSurfaceMeshes: ground plane, roads, river
-// These remain as single merged meshes (efficient enough for flat quads)
+// BuildProceduralMeshes:
+//   1. Ground Model: Solid terrain base (Ground color #e2e4ea)
+//   2. Road Model: Distinct road network (#cdd1dc)
+//   3. River Model: Water blue (#4299e1)
+//   4. Shadow Model: Soft ground contact Ambient Occlusion under buildings
+//   5. Building Model: 3D buildings with baked vertex Ambient Occlusion!
 // =========================================================================
-void RaycastWorld::BuildFlatSurfaceMeshes() {
-    std::vector<float> gndVerts, gndNorms, gndUvs;
-    std::vector<float> roadVerts, roadNorms, roadUvs;
-    std::vector<float> riverVerts, riverNorms, riverUvs;
-
+void RaycastWorld::BuildProceduralMeshes() {
     float s = m_cellWorldSize;
-
-    // 1. Solid Ground Plane across the entire world (no sky holes!)
     float totalW = m_gridWidth * s;
     float totalH = m_gridHeight * s;
     float halfW = totalW * 0.5f;
     float halfH = totalH * 0.5f;
 
-    Vector3 gp0 = {-halfW, GROUND_Y, -halfH};
-    Vector3 gp1 = { halfW, GROUND_Y, -halfH};
-    Vector3 gp2 = { halfW, GROUND_Y,  halfH};
-    Vector3 gp3 = {-halfW, GROUND_Y,  halfH};
-    PushQuad(gndVerts, gndNorms, gndUvs, gp0, gp1, gp2, gp3, {0, 1, 0});
+    // =====================================================================
+    // 1. Solid Ground Plane across the entire world (no sky holes!)
+    // =====================================================================
+    {
+        std::vector<float> gndV, gndN, gndU;
+        float pad = 20.0f;
+        Vector3 gp0 = {-halfW - pad, GROUND_Y, -halfH - pad};
+        Vector3 gp1 = { halfW + pad, GROUND_Y, -halfH - pad};
+        Vector3 gp2 = { halfW + pad, GROUND_Y,  halfH + pad};
+        Vector3 gp3 = {-halfW - pad, GROUND_Y,  halfH + pad};
+        PushQuad(gndV, gndN, gndU, gp0, gp1, gp2, gp3, {0, 1, 0});
+        m_groundModel = CreateModelFromBuffers(gndV, gndN, gndU);
+    }
 
+    // =====================================================================
     // 2. Procedural Road and River Surfaces
-    for (int y = 0; y < m_gridHeight; y++) {
-        for (int x = 0; x < m_gridWidth; x++) {
-            MapTileType type = GetTile(x, y);
-            float wx = (x - m_gridWidth / 2.0f) * s;
-            float wz = (y - m_gridHeight / 2.0f) * s;
+    // =====================================================================
+    {
+        std::vector<float> roadV, roadN, roadU;
+        std::vector<float> riverV, riverN, riverU;
 
-            if (type == TILE_ROAD) {
-                Vector3 p0 = {wx,     ROAD_Y, wz};
-                Vector3 p1 = {wx + s, ROAD_Y, wz};
-                Vector3 p2 = {wx + s, ROAD_Y, wz + s};
-                Vector3 p3 = {wx,     ROAD_Y, wz + s};
-                PushQuad(roadVerts, roadNorms, roadUvs, p0, p1, p2, p3, {0, 1, 0});
-            } else if (type == TILE_RIVER) {
-                Vector3 p0 = {wx,     RIVER_Y, wz};
-                Vector3 p1 = {wx + s, RIVER_Y, wz};
-                Vector3 p2 = {wx + s, RIVER_Y, wz + s};
-                Vector3 p3 = {wx,     RIVER_Y, wz + s};
-                PushQuad(riverVerts, riverNorms, riverUvs, p0, p1, p2, p3, {0, 1, 0});
+        for (int y = 0; y < m_gridHeight; y++) {
+            for (int x = 0; x < m_gridWidth; x++) {
+                MapTileType type = GetTile(x, y);
+                float wx = (x - m_gridWidth / 2.0f) * s;
+                float wz = (y - m_gridHeight / 2.0f) * s;
+
+                if (type == TILE_ROAD) {
+                    Vector3 p0 = {wx,     ROAD_Y, wz};
+                    Vector3 p1 = {wx + s, ROAD_Y, wz};
+                    Vector3 p2 = {wx + s, ROAD_Y, wz + s};
+                    Vector3 p3 = {wx,     ROAD_Y, wz + s};
+                    PushQuad(roadV, roadN, roadU, p0, p1, p2, p3, {0, 1, 0});
+                } else if (type == TILE_RIVER) {
+                    Vector3 p0 = {wx,     RIVER_Y, wz};
+                    Vector3 p1 = {wx + s, RIVER_Y, wz};
+                    Vector3 p2 = {wx + s, RIVER_Y, wz + s};
+                    Vector3 p3 = {wx,     RIVER_Y, wz + s};
+                    PushQuad(riverV, riverN, riverU, p0, p1, p2, p3, {0, 1, 0});
+                }
             }
         }
+
+        m_roadModel = CreateModelFromBuffers(roadV, roadN, roadU);
+        m_riverModel = CreateModelFromBuffers(riverV, riverN, riverU);
     }
 
-    m_groundModel = CreateModelFromBuffers(gndVerts, gndNorms, gndUvs);
-    m_roadModel = CreateModelFromBuffers(roadVerts, roadNorms, roadUvs);
-    m_riverModel = CreateModelFromBuffers(riverVerts, riverNorms, riverUvs);
-    m_flatModelsLoaded = true;
-}
+    // =====================================================================
+    // 3. Ground Contact Ambient Occlusion (Soft Drop Shadows under buildings)
+    //    Darkens the ground right around building footprints with smooth falloff
+    // =====================================================================
+    {
+        std::vector<float> shdV, shdN, shdU;
+        std::vector<unsigned char> shdC;
 
-// =========================================================================
-// GPU INSTANCED RENDERING OPTIMIZATION
-// =========================================================================
-// Instead of baking ALL building geometry into one giant mesh (100K+ verts),
-// we create ~15 prototype cube meshes with distinct (width, depth, height)
-// and use DrawMeshInstanced() to render all instances of each prototype
-// in a SINGLE draw call.
-//
-// Result: ~15 draw calls instead of 1 giant VBO = massively better FPS
-// =========================================================================
+        for (const auto& lot : m_buildingLots) {
+            float wx0 = (lot.x - m_gridWidth / 2.0f) * s + lot.inset;
+            float wz0 = (lot.y - m_gridHeight / 2.0f) * s + lot.inset;
+            float wx1 = (lot.x + lot.w - m_gridWidth / 2.0f) * s - lot.inset;
+            float wz1 = (lot.y + lot.h - m_gridHeight / 2.0f) * s - lot.inset;
 
-// Hash key for building prototype: quantized (w, d, h, hasPenthouse)
-struct ProtoKey {
-    int qw, qd, qh;
-    bool penthouse;
+            float padAO = 0.22f * s; // Soft AO shadow margin
+            float sx0 = wx0 - padAO;
+            float sz0 = wz0 - padAO;
+            float sx1 = wx1 + padAO;
+            float sz1 = wz1 + padAO;
 
-    bool operator==(const ProtoKey& o) const {
-        return qw == o.qw && qd == o.qd && qh == o.qh && penthouse == o.penthouse;
-    }
-};
-
-struct ProtoKeyHash {
-    size_t operator()(const ProtoKey& k) const {
-        size_t h = (size_t)k.qw * 73856093;
-        h ^= (size_t)k.qd * 19349663;
-        h ^= (size_t)k.qh * 83492791;
-        h ^= k.penthouse ? 1 : 0;
-        return h;
-    }
-};
-
-// Quantize a float dimension into discrete buckets for prototype grouping
-static int QuantizeDim(float val, float step) {
-    return (int)(val / step + 0.5f);
-}
-
-void RaycastWorld::BuildInstancedBuildings() {
-    m_buildingPrototypes.clear();
-
-    float s = m_cellWorldSize;
-
-    // Step 1: Quantize all building lots into prototype buckets
-    // Width/depth quantized to 0.15 units, height to 0.4 units
-    // This typically yields ~12-16 unique prototypes from thousands of lots
-    const float DIM_STEP = 0.15f;
-    const float HEIGHT_STEP = 0.4f;
-
-    std::unordered_map<ProtoKey, int, ProtoKeyHash> protoMap;
-
-    struct InstanceData {
-        ProtoKey key;
-        float cx, cz;   // Center position in world
-        float actualW, actualD, actualH; // Actual dimensions for this lot
-    };
-    std::vector<InstanceData> instances;
-    instances.reserve(m_buildingLots.size());
-
-    for (const auto& lot : m_buildingLots) {
-        float wx0 = (lot.x - m_gridWidth / 2.0f) * s;
-        float wz0 = (lot.y - m_gridHeight / 2.0f) * s;
-        float wx1 = (lot.x + lot.w - m_gridWidth / 2.0f) * s;
-        float wz1 = (lot.y + lot.h - m_gridHeight / 2.0f) * s;
-
-        float bx0 = wx0 + lot.inset;
-        float bx1 = wx1 - lot.inset;
-        float bz0 = wz0 + lot.inset;
-        float bz1 = wz1 - lot.inset;
-
-        float bw = bx1 - bx0;
-        float bd = bz1 - bz0;
-        float bh = lot.height;
-
-        if (bw <= 0.05f || bd <= 0.05f || bh <= 0.05f) continue;
-
-        ProtoKey key;
-        key.qw = QuantizeDim(bw, DIM_STEP);
-        key.qd = QuantizeDim(bd, DIM_STEP);
-        key.qh = QuantizeDim(bh, HEIGHT_STEP);
-        key.penthouse = lot.hasPenthouse && (bw > 0.6f) && (bd > 0.6f);
-
-        // Ensure minimum quantized values
-        if (key.qw < 1) key.qw = 1;
-        if (key.qd < 1) key.qd = 1;
-        if (key.qh < 1) key.qh = 1;
-
-        float cx = (bx0 + bx1) * 0.5f;
-        float cz = (bz0 + bz1) * 0.5f;
-
-        InstanceData inst;
-        inst.key = key;
-        inst.cx = cx;
-        inst.cz = cz;
-        inst.actualW = bw;
-        inst.actualD = bd;
-        inst.actualH = bh;
-        instances.push_back(inst);
-
-        if (protoMap.find(key) == protoMap.end()) {
-            protoMap[key] = (int)protoMap.size();
-        }
-    }
-
-    TraceLog(LOG_INFO, "Building instancing: %d lots -> %d unique prototypes",
-             (int)m_buildingLots.size(), (int)protoMap.size());
-
-    // Step 2: Create one Mesh per unique prototype (unit cube scaled by prototype dims)
-    m_buildingPrototypes.resize(protoMap.size());
-
-    for (auto& [key, idx] : protoMap) {
-        float pw = key.qw * DIM_STEP;
-        float pd = key.qd * DIM_STEP;
-        float ph = key.qh * HEIGHT_STEP;
-
-        // Generate building mesh at origin: base cube + optional penthouse on top
-        std::vector<float> verts, norms, uvs;
-        float hw = pw * 0.5f;
-        float hd = pd * 0.5f;
-
-        // Main building body (centered at origin, bottom at y=0, top at y=ph)
-        // Top roof
-        PushQuad(verts, norms, uvs,
-                 {-hw, ph, -hd}, {hw, ph, -hd}, {hw, ph, hd}, {-hw, ph, hd}, {0, 1, 0});
-        // North wall
-        PushQuad(verts, norms, uvs,
-                 {hw, 0, -hd}, {-hw, 0, -hd}, {-hw, ph, -hd}, {hw, ph, -hd}, {0, 0, -1});
-        // South wall
-        PushQuad(verts, norms, uvs,
-                 {-hw, 0, hd}, {hw, 0, hd}, {hw, ph, hd}, {-hw, ph, hd}, {0, 0, 1});
-        // West wall
-        PushQuad(verts, norms, uvs,
-                 {-hw, 0, -hd}, {-hw, 0, hd}, {-hw, ph, hd}, {-hw, ph, -hd}, {-1, 0, 0});
-        // East wall
-        PushQuad(verts, norms, uvs,
-                 {hw, 0, hd}, {hw, 0, -hd}, {hw, ph, -hd}, {hw, ph, hd}, {1, 0, 0});
-
-        // Penthouse structure on top
-        if (key.penthouse) {
-            float px = hw * 0.56f;
-            float pz = hd * 0.56f;
-            float pTop = ph + 0.45f;
-
-            PushQuad(verts, norms, uvs,
-                     {-px, pTop, -pz}, {px, pTop, -pz}, {px, pTop, pz}, {-px, pTop, pz}, {0, 1, 0});
-            PushQuad(verts, norms, uvs,
-                     {px, ph, -pz}, {-px, ph, -pz}, {-px, pTop, -pz}, {px, pTop, -pz}, {0, 0, -1});
-            PushQuad(verts, norms, uvs,
-                     {-px, ph, pz}, {px, ph, pz}, {px, pTop, pz}, {-px, pTop, pz}, {0, 0, 1});
-            PushQuad(verts, norms, uvs,
-                     {-px, ph, -pz}, {-px, ph, pz}, {-px, pTop, pz}, {-px, pTop, -pz}, {-1, 0, 0});
-            PushQuad(verts, norms, uvs,
-                     {px, ph, pz}, {px, ph, -pz}, {px, pTop, -pz}, {px, pTop, pz}, {1, 0, 0});
+            // Soft contact shadow color
+            Color cShadow = {40, 45, 60, 130};
+            PushQuadAO(shdV, shdN, shdU, shdC,
+                       {sx0, SHADOW_Y, sz0}, {sx1, SHADOW_Y, sz0},
+                       {sx1, SHADOW_Y, sz1}, {sx0, SHADOW_Y, sz1},
+                       {0, 1, 0},
+                       cShadow, cShadow, cShadow, cShadow);
         }
 
-        // Build GPU mesh
-        BuildingPrototype& proto = m_buildingPrototypes[idx];
-        Mesh mesh = {0};
-        mesh.triangleCount = (int)(verts.size() / 9);
-        mesh.vertexCount = (int)(verts.size() / 3);
-        mesh.vertices = (float*)MemAlloc(sizeof(float) * verts.size());
-        mesh.normals = (float*)MemAlloc(sizeof(float) * norms.size());
-        mesh.texcoords = (float*)MemAlloc(sizeof(float) * uvs.size());
-        memcpy(mesh.vertices, verts.data(), sizeof(float) * verts.size());
-        memcpy(mesh.normals, norms.data(), sizeof(float) * norms.size());
-        memcpy(mesh.texcoords, uvs.data(), sizeof(float) * uvs.size());
-        UploadMesh(&mesh, false);
-
-        proto.mesh = mesh;
-        proto.material = LoadMaterialDefault();
-        // Gedung: user exact color #f7f3f2 (247, 243, 242)
-        proto.material.maps[MATERIAL_MAP_DIFFUSE].color = (Color){247, 243, 242, 255};
-        proto.uploaded = true;
+        m_shadowModel = CreateModelFromBuffers(shdV, shdN, shdU, shdC);
     }
 
-    // Step 3: Assign instance transforms to each prototype
-    for (const auto& inst : instances) {
-        auto it = protoMap.find(inst.key);
-        if (it == protoMap.end()) continue;
+    // =====================================================================
+    // 4. Procedural 3D Buildings with Baked Vertex Ambient Occlusion!
+    //    - Vertical gradient: Dark contact AO at street level -> bright sky top
+    //    - Directional sunlight shading: South/East sunlit, North/West in shade
+    //    - Roofs: User's exact #f7f3f2 pristine white
+    // =====================================================================
+    {
+        std::vector<float> bldV, bldN, bldU;
+        std::vector<unsigned char> bldC;
 
-        int protoIdx = it->second;
+        // Sunlight light factors by wall direction (Sun from South-East)
+        const float LIGHT_ROOF  = 1.00f;
+        const float LIGHT_SOUTH = 0.92f;
+        const float LIGHT_EAST  = 0.86f;
+        const float LIGHT_WEST  = 0.77f;
+        const float LIGHT_NORTH = 0.68f;
 
-        // Each instance is placed at its world center, bottom at GROUND_Y
-        // The mesh is already built centered at origin with base at y=0
-        // So we just translate to world position
-        Matrix transform = MatrixTranslate(inst.cx, GROUND_Y, inst.cz);
+        // Ambient Occlusion factors
+        const float AO_ROOF_OPEN = 1.00f;
+        const float AO_TOP_WALL  = 0.94f; // High elevation: open sky ambient
+        const float AO_BASE_WALL = 0.65f; // Street level: deep corner contact shadow
 
-        m_buildingPrototypes[protoIdx].transforms.push_back(transform);
+        for (const auto& lot : m_buildingLots) {
+            float wx0 = (lot.x - m_gridWidth / 2.0f) * s;
+            float wz0 = (lot.y - m_gridHeight / 2.0f) * s;
+            float wx1 = (lot.x + lot.w - m_gridWidth / 2.0f) * s;
+            float wz1 = (lot.y + lot.h - m_gridHeight / 2.0f) * s;
+
+            float bx0 = wx0 + lot.inset;
+            float bx1 = wx1 - lot.inset;
+            float bz0 = wz0 + lot.inset;
+            float bz1 = wz1 - lot.inset;
+            float bh = lot.height;
+
+            if (bx1 <= bx0 || bz1 <= bz0) continue;
+
+            // -------------------------------------------------------------
+            // Top Roof Face: User exact pristine color #f7f3f2
+            // -------------------------------------------------------------
+            Color cRoof = CalcShadedColor(BLD_BASE_COLOR, LIGHT_ROOF, AO_ROOF_OPEN);
+            Vector3 r0 = {bx0, GROUND_Y + bh, bz0};
+            Vector3 r1 = {bx1, GROUND_Y + bh, bz0};
+            Vector3 r2 = {bx1, GROUND_Y + bh, bz1};
+            Vector3 r3 = {bx0, GROUND_Y + bh, bz1};
+            PushQuadAO(bldV, bldN, bldU, bldC, r0, r1, r2, r3, {0, 1, 0}, cRoof, cRoof, cRoof, cRoof);
+
+            // -------------------------------------------------------------
+            // South Wall: Sunlit, vertical AO gradient from base to top
+            // -------------------------------------------------------------
+            Color cSouthBase = CalcShadedColor(BLD_BASE_COLOR, LIGHT_SOUTH, AO_BASE_WALL);
+            Color cSouthTop  = CalcShadedColor(BLD_BASE_COLOR, LIGHT_SOUTH, AO_TOP_WALL);
+            Vector3 sf0 = {bx0, GROUND_Y, bz1}, sf1 = {bx1, GROUND_Y, bz1};
+            Vector3 sf2 = {bx1, GROUND_Y + bh, bz1}, sf3 = {bx0, GROUND_Y + bh, bz1};
+            PushQuadAO(bldV, bldN, bldU, bldC, sf0, sf1, sf2, sf3, {0, 0, 1},
+                       cSouthBase, cSouthBase, cSouthTop, cSouthTop);
+
+            // -------------------------------------------------------------
+            // North Wall: Shaded side, vertical AO gradient
+            // -------------------------------------------------------------
+            Color cNorthBase = CalcShadedColor(BLD_BASE_COLOR, LIGHT_NORTH, AO_BASE_WALL * 0.95f);
+            Color cNorthTop  = CalcShadedColor(BLD_BASE_COLOR, LIGHT_NORTH, AO_TOP_WALL);
+            Vector3 nb0 = {bx1, GROUND_Y, bz0}, nb1 = {bx0, GROUND_Y, bz0};
+            Vector3 nb2 = {bx0, GROUND_Y + bh, bz0}, nb3 = {bx1, GROUND_Y + bh, bz0};
+            PushQuadAO(bldV, bldN, bldU, bldC, nb0, nb1, nb2, nb3, {0, 0, -1},
+                       cNorthBase, cNorthBase, cNorthTop, cNorthTop);
+
+            // -------------------------------------------------------------
+            // East Wall: Morning sunlit, vertical AO gradient
+            // -------------------------------------------------------------
+            Color cEastBase = CalcShadedColor(BLD_BASE_COLOR, LIGHT_EAST, AO_BASE_WALL);
+            Color cEastTop  = CalcShadedColor(BLD_BASE_COLOR, LIGHT_EAST, AO_TOP_WALL);
+            Vector3 er0 = {bx1, GROUND_Y, bz1}, er1 = {bx1, GROUND_Y, bz0};
+            Vector3 er2 = {bx1, GROUND_Y + bh, bz0}, er3 = {bx1, GROUND_Y + bh, bz1};
+            PushQuadAO(bldV, bldN, bldU, bldC, er0, er1, er2, er3, {1, 0, 0},
+                       cEastBase, cEastBase, cEastTop, cEastTop);
+
+            // -------------------------------------------------------------
+            // West Wall: Grazing light, vertical AO gradient
+            // -------------------------------------------------------------
+            Color cWestBase = CalcShadedColor(BLD_BASE_COLOR, LIGHT_WEST, AO_BASE_WALL);
+            Color cWestTop  = CalcShadedColor(BLD_BASE_COLOR, LIGHT_WEST, AO_TOP_WALL);
+            Vector3 wl0 = {bx0, GROUND_Y, bz0}, wl1 = {bx0, GROUND_Y, bz1};
+            Vector3 wl2 = {bx0, GROUND_Y + bh, bz1}, wl3 = {bx0, GROUND_Y + bh, bz0};
+            PushQuadAO(bldV, bldN, bldU, bldC, wl0, wl1, wl2, wl3, {-1, 0, 0},
+                       cWestBase, cWestBase, cWestTop, cWestTop);
+
+            // -------------------------------------------------------------
+            // Architectural Rooftop Penthouse for tall buildings
+            // -------------------------------------------------------------
+            if (lot.hasPenthouse && (bx1 - bx0 > 0.6f) && (bz1 - bz0 > 0.6f)) {
+                float px0 = bx0 + (bx1 - bx0) * 0.22f;
+                float px1 = bx1 - (bx1 - bx0) * 0.22f;
+                float pz0 = bz0 + (bz1 - bz0) * 0.22f;
+                float pz1 = bz1 - (bz1 - bz0) * 0.22f;
+                float ph = GROUND_Y + bh + 0.45f;
+                float base = GROUND_Y + bh;
+
+                Color cPenthRoof = CalcShadedColor(BLD_BASE_COLOR, 0.98f, 0.98f);
+                Color cPenthSouth = CalcShadedColor(BLD_BASE_COLOR, LIGHT_SOUTH, 0.92f);
+                Color cPenthNorth = CalcShadedColor(BLD_BASE_COLOR, LIGHT_NORTH, 0.88f);
+                Color cPenthEast  = CalcShadedColor(BLD_BASE_COLOR, LIGHT_EAST, 0.90f);
+                Color cPenthWest  = CalcShadedColor(BLD_BASE_COLOR, LIGHT_WEST, 0.85f);
+
+                // Penthouse Roof
+                PushQuadAO(bldV, bldN, bldU, bldC,
+                           {px0, ph, pz0}, {px1, ph, pz0}, {px1, ph, pz1}, {px0, ph, pz1},
+                           {0, 1, 0}, cPenthRoof, cPenthRoof, cPenthRoof, cPenthRoof);
+                // Penthouse South
+                PushQuadAO(bldV, bldN, bldU, bldC,
+                           {px0, base, pz1}, {px1, base, pz1}, {px1, ph, pz1}, {px0, ph, pz1},
+                           {0, 0, 1}, cPenthSouth, cPenthSouth, cPenthSouth, cPenthSouth);
+                // Penthouse North
+                PushQuadAO(bldV, bldN, bldU, bldC,
+                           {px1, base, pz0}, {px0, base, pz0}, {px0, ph, pz0}, {px1, ph, pz0},
+                           {0, 0, -1}, cPenthNorth, cPenthNorth, cPenthNorth, cPenthNorth);
+                // Penthouse East
+                PushQuadAO(bldV, bldN, bldU, bldC,
+                           {px1, base, pz1}, {px1, base, pz0}, {px1, ph, pz0}, {px1, ph, pz1},
+                           {1, 0, 0}, cPenthEast, cPenthEast, cPenthEast, cPenthEast);
+                // Penthouse West
+                PushQuadAO(bldV, bldN, bldU, bldC,
+                           {px0, base, pz0}, {px0, base, pz1}, {px0, ph, pz1}, {px0, ph, pz0},
+                           {-1, 0, 0}, cPenthWest, cPenthWest, cPenthWest, cPenthWest);
+            }
+        }
+
+        m_buildingModel = CreateModelFromBuffers(bldV, bldN, bldU, bldC);
+
+        int totalVerts = (int)(bldV.size() / 3);
+        TraceLog(LOG_INFO, "3D Buildings compiled: %d lots, %d vertices with baked Ambient Occlusion",
+                 (int)m_buildingLots.size(), totalVerts);
     }
 
-    // Log instance counts
-    for (size_t i = 0; i < m_buildingPrototypes.size(); i++) {
-        TraceLog(LOG_INFO, "  Prototype %d: %d instances, %d verts/instance",
-                 (int)i, (int)m_buildingPrototypes[i].transforms.size(),
-                 m_buildingPrototypes[i].mesh.vertexCount);
-    }
-
-    m_buildingsLoaded = true;
+    m_modelsLoaded = true;
 }
 
 void RaycastWorld::Draw3D(bool showLidarRays) {
+    if (!m_modelsLoaded) return;
+
+    // Double-sided rendering ensures all faces are visible from every camera angle
     rlDisableBackfaceCulling();
 
-    // 1. Solid Ground Floor: #cdd1dc (never transparent/sky void)
-    if (m_flatModelsLoaded) {
-        Color groundColor = {205, 209, 220, 255};
-        if (m_groundModel.meshCount > 0 && m_groundModel.meshes[0].vertexCount > 0)
-            DrawModel(m_groundModel, {0, 0, 0}, 1.0f, groundColor);
+    // 1. Solid Ground Floor (#e2e4ea neutral terrain)
+    if (m_groundModel.meshCount > 0 && m_groundModel.meshes[0].vertexCount > 0)
+        DrawModel(m_groundModel, {0, 0, 0}, 1.0f, GROUND_COLOR);
 
-        // 2. Sungai: water blue (#4299e1)
-        Color riverColor = {66, 153, 225, 255};
-        if (m_riverModel.meshCount > 0 && m_riverModel.meshes[0].vertexCount > 0)
-            DrawModel(m_riverModel, {0, 0, 0}, 1.0f, riverColor);
+    // 2. Sungai: water blue (#4299e1)
+    if (m_riverModel.meshCount > 0 && m_riverModel.meshes[0].vertexCount > 0)
+        DrawModel(m_riverModel, {0, 0, 0}, 1.0f, RIVER_COLOR);
 
-        // 3. Jalan: distinct road shade of #cdd1dc
-        Color roadColor = {176, 181, 196, 255};
-        if (m_roadModel.meshCount > 0 && m_roadModel.meshes[0].vertexCount > 0)
-            DrawModel(m_roadModel, {0, 0, 0}, 1.0f, roadColor);
-    }
+    // 3. Jalan: distinct road shade #cdd1dc (user's exact road color)
+    if (m_roadModel.meshCount > 0 && m_roadModel.meshes[0].vertexCount > 0)
+        DrawModel(m_roadModel, {0, 0, 0}, 1.0f, ROAD_COLOR);
 
-    // 4. GPU Instanced Buildings: ~15 draw calls instead of thousands!
-    if (m_buildingsLoaded) {
-        for (auto& proto : m_buildingPrototypes) {
-            if (!proto.uploaded || proto.transforms.empty()) continue;
-            DrawMeshInstanced(proto.mesh, proto.material, proto.transforms.data(),
-                              (int)proto.transforms.size());
-        }
-    }
+    // 4. Ground Contact Ambient Occlusion (Soft shadows under buildings)
+    if (m_shadowModel.meshCount > 0 && m_shadowModel.meshes[0].vertexCount > 0)
+        DrawModel(m_shadowModel, {0, 0, 0}, 1.0f, WHITE);
+
+    // 5. Gedung: #f7f3f2 with baked vertex Ambient Occlusion & Directional Shading
+    // Using WHITE multiplies vertex colors directly (zero shader cost, max optimization!)
+    if (m_buildingModel.meshCount > 0 && m_buildingModel.meshes[0].vertexCount > 0)
+        DrawModel(m_buildingModel, {0, 0, 0}, 1.0f, WHITE);
 
     rlEnableBackfaceCulling();
 }

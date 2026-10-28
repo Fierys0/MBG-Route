@@ -9,9 +9,9 @@
 // Tile types classified from map image
 enum MapTileType : uint8_t {
     TILE_GRASS = 0,
-    TILE_ROAD,        // abu-abu (gray)
-    TILE_BUILDING,    // putih (white)
-    TILE_RIVER,       // biru (blue)
+    TILE_ROAD,        // jalan: #cdd1dc (abu-abu)
+    TILE_BUILDING,    // gedung: #f7f3f2 (putih)
+    TILE_RIVER,       // sungai: biru (#4299e1)
     TILE_COUNT
 };
 
@@ -24,20 +24,6 @@ struct RayHitResult {
     MapTileType tileType;
 };
 
-// =========================================================================
-// GPU Instanced Building Prototype
-// A single mesh shape reused at many positions via DrawMeshInstanced()
-// =========================================================================
-struct BuildingPrototype {
-    Mesh mesh;
-    Material material;
-    std::vector<Matrix> transforms; // Per-instance world transforms
-    bool uploaded = false;
-};
-
-// Max number of distinct building prototypes (different w x d x h combos)
-static const int MAX_BUILDING_PROTOTYPES = 16;
-
 // Procedural 3D City generated via Ray Casting against the map image
 class RaycastWorld {
 public:
@@ -48,7 +34,7 @@ public:
     bool GenerateFromImage(const char* imagePath, int downscaleFactor = 6);
     void Cleanup();
 
-    // 3D Rendering
+    // 3D Rendering with baked vertex ambient occlusion & directional lighting
     void Draw3D(bool showLidarRays);
 
     // Coordinate conversions between grid and 3D world
@@ -86,16 +72,20 @@ private:
     std::vector<int> m_connectedComponent; // Component ID per cell
     std::vector<Vector2> m_mainRoadCells;  // Cells in the largest connected road network
 
-    // 3D Models / Meshes generated procedurally (flat surfaces only)
+    // =========================================================================
+    // Procedural 3D Models with Maximum Optimization:
+    // 1. Ground Plane: neutral terrain floor
+    // 2. Road Model: road network (#cdd1dc)
+    // 3. River Model: water blue (#4299e1)
+    // 4. Ground Contact AO: soft ambient occlusion shadow skirts under buildings
+    // 5. Building Model: 3D structures with baked vertex ambient occlusion
+    // =========================================================================
     Model m_groundModel;
     Model m_roadModel;
-    Model m_grassModel;
     Model m_riverModel;
-    bool m_flatModelsLoaded = false;
-
-    // GPU Instanced Building Prototypes (~15 unique shapes, thousands of instances)
-    std::vector<BuildingPrototype> m_buildingPrototypes;
-    bool m_buildingsLoaded = false;
+    Model m_shadowModel;
+    Model m_buildingModel;
+    bool m_modelsLoaded = false;
 
     Texture2D m_mapTexture;
     bool m_textureLoaded = false;
@@ -104,6 +94,7 @@ private:
         int x, y, w, h;
         float height;
         float inset;
+        int style;          // Architectural archetype style (1-12)
         bool hasPenthouse;
     };
     std::vector<BuildingLot> m_buildingLots;
@@ -112,6 +103,5 @@ private:
     MapTileType ClassifyPixelColor(Color c) const;
     void AnalyzeRoadConnectivity();
     void PartitionBuildingLots();
-    void BuildFlatSurfaceMeshes();
-    void BuildInstancedBuildings();
+    void BuildProceduralMeshes();
 };
