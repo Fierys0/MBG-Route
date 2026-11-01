@@ -1,6 +1,7 @@
 #include "pathfinder.hpp"
 #include <queue>
 #include <unordered_map>
+#include <unordered_set>
 #include <cmath>
 #include <chrono>
 #include <algorithm>
@@ -33,7 +34,9 @@ float Pathfinder::HeuristicOctile(float x1, float y1, float x2, float y2) const 
     return dx + dy + (1.41421356f - 2.0f) * fminf(dx, dy);
 }
 
-PathResult Pathfinder::FindShortestPath(const RaycastWorld& world, Vector2 start, Vector2 goal, AlgorithmType algo) {
+PathResult Pathfinder::FindShortestPath(const RaycastWorld& world, Vector2 start, Vector2 goal, AlgorithmType algo,
+                                        const std::vector<Vector2>& blockedCells,
+                                        const std::vector<Vector2>& trafficCells) {
     PathResult result;
     result.algorithm = algo;
     result.found = false;
@@ -50,9 +53,23 @@ PathResult Pathfinder::FindShortestPath(const RaycastWorld& world, Vector2 start
         return result;
     }
 
+    // Fast lookup sets for blocked cells and traffic congestion
+    using PII = std::pair<int, int>;
+    std::unordered_set<PII, CoordHash> blockedSet;
+    for (const auto& b : blockedCells) {
+        int bx = (int)roundf(b.x);
+        int by = (int)roundf(b.y);
+        if ((bx == sx && by == sy) || (bx == gx && by == gy)) continue; // don't block start/goal itself
+        blockedSet.insert({bx, by});
+    }
+
+    std::unordered_set<PII, CoordHash> trafficSet;
+    for (const auto& t : trafficCells) {
+        trafficSet.insert({(int)roundf(t.x), (int)roundf(t.y)});
+    }
+
     auto startTime = std::chrono::high_resolution_clock::now();
 
-    using PII = std::pair<int, int>;
     std::priority_queue<PQNode, std::vector<PQNode>, std::greater<PQNode>> openList;
     std::unordered_map<PII, float, CoordHash> gScore;
     std::unordered_map<PII, PII, CoordHash> cameFrom;
@@ -87,17 +104,31 @@ PathResult Pathfinder::FindShortestPath(const RaycastWorld& world, Vector2 start
             result.found = true;
             result.gridPath = path;
 
-            // Compute world waypoints and total distance
+            // Compute world waypoints, distance, and traffic congestion
             result.worldWaypoints.clear();
+            result.waypointInTraffic.clear();
             float totalDist = 0.0f;
+            float trafficDist = 0.0f;
+
             for (size_t i = 0; i < path.size(); i++) {
                 Vector3 wp = world.GridToWorld(path[i].x, path[i].y, 0.05f);
                 result.worldWaypoints.push_back(wp);
+
+                bool isTf = trafficSet.count({(int)roundf(path[i].x), (int)roundf(path[i].y)});
+                result.waypointInTraffic.push_back(isTf);
+
                 if (i > 0) {
-                    totalDist += Vector3Distance(result.worldWaypoints[i - 1], wp);
+                    float d = Vector3Distance(result.worldWaypoints[i - 1], wp);
+                    totalDist += d;
+                    if (isTf) {
+                        trafficDist += d;
+                    }
                 }
             }
             result.totalDistanceWorld = totalDist;
+            result.trafficDistanceWorld = trafficDist;
+            // Realistic traffic delay: traffic distance unit ~ 0.85 minutes delay
+            result.trafficDelayMinutes = trafficDist * 0.85f;
             break;
         }
 
@@ -114,15 +145,24 @@ PathResult Pathfinder::FindShortestPath(const RaycastWorld& world, Vector2 start
                 continue;
             }
 
+            // Road Block / Constraint check (Tent / Closed road)
+            if (blockedSet.count({nx, ny})) {
+                continue;
+            }
+
             // Diagonal corner-cutting check
             if (dx[i] != 0 && dy[i] != 0) {
                 if (!world.IsWalkable(current.x + dx[i], current.y) ||
-                    !world.IsWalkable(current.x, current.y + dy[i])) {
-                    continue; // do not cut through building corners
+                    !world.IsWalkable(current.x, current.y + dy[i]) ||
+                    blockedSet.count({current.x + dx[i], current.y}) ||
+                    blockedSet.count({current.x, current.y + dy[i]})) {
+                    continue; // do not cut through building or blocked corners
                 }
             }
 
-            float newG = current.gCost + moveCost[i];
+            // Traffic congestion penalty: +3.5x cost so pathfinder considers detours if available
+            float costMult = trafficSet.count({nx, ny}) ? 3.5f : 1.0f;
+            float newG = current.gCost + moveCost[i] * costMult;
             PII nextCoord = {nx, ny};
 
             if (!gScore.count(nextCoord) || newG < gScore[nextCoord] - 0.001f) {
@@ -146,8 +186,12 @@ PathResult Pathfinder::FindShortestPath(const RaycastWorld& world, Vector2 start
     return result;
 }
 
-Model Pathfinder::BuildPathMeshModel(const RaycastWorld& world, const std::vector<Vector2>& path, float ribbonWidth, float elevationY) {
+Model Pathfinder::BuildPathMeshModel(const RaycastWorld& world, const std::vector<Vector2>& path,
+                                    Color baseColor, const std::vector<bool>& inTraffic,
+                                    float ribbonWidth, float elevationY, bool isBorder,
+                                    bool isBlockedStyle) {
     std::vector<float> verts, normals, uvs;
+    std::vector<unsigned char> colors;
 
     if (path.size() < 2) {
         Mesh mesh = {0};
@@ -174,6 +218,19 @@ Model Pathfinder::BuildPathMeshModel(const RaycastWorld& world, const std::vecto
         Vector3 p2 = Vector3Subtract(b, perp);
         Vector3 p3 = Vector3Add(b, perp);
 
+        // Segment coloring
+        bool segTraffic = (i < inTraffic.size() && inTraffic[i]);
+        Color segColor;
+        if (isBlockedStyle) {
+            // Hazard stripe pattern: alternating Red and Yellow/White every 2 segments
+            bool stripe = ((i / 2) % 2 == 0);
+            segColor = stripe ? (Color){230, 45, 45, 220} : (Color){255, 235, 70, 200};
+        } else if (isBorder) {
+            segColor = segTraffic ? (Color){180, 25, 25, 240} : (Color){255, 255, 255, 240};
+        } else {
+            segColor = segTraffic ? (Color){230, 40, 40, 255} : baseColor;
+        }
+
         // Front face
         verts.push_back(p0.x); verts.push_back(p0.y); verts.push_back(p0.z);
         verts.push_back(p1.x); verts.push_back(p1.y); verts.push_back(p1.z);
@@ -195,6 +252,10 @@ Model Pathfinder::BuildPathMeshModel(const RaycastWorld& world, const std::vecto
         for (int k = 0; k < 12; k++) {
             normals.push_back(0.0f); normals.push_back(1.0f); normals.push_back(0.0f);
             uvs.push_back(0.0f); uvs.push_back(0.0f);
+            colors.push_back(segColor.r);
+            colors.push_back(segColor.g);
+            colors.push_back(segColor.b);
+            colors.push_back(segColor.a);
         }
     }
 
@@ -207,10 +268,12 @@ Model Pathfinder::BuildPathMeshModel(const RaycastWorld& world, const std::vecto
     mesh.vertices = (float*)MemAlloc(sizeof(float) * verts.size());
     mesh.normals = (float*)MemAlloc(sizeof(float) * normals.size());
     mesh.texcoords = (float*)MemAlloc(sizeof(float) * uvs.size());
+    mesh.colors = (unsigned char*)MemAlloc(sizeof(unsigned char) * colors.size());
 
     memcpy(mesh.vertices, verts.data(), sizeof(float) * verts.size());
     memcpy(mesh.normals, normals.data(), sizeof(float) * normals.size());
     memcpy(mesh.texcoords, uvs.data(), sizeof(float) * uvs.size());
+    memcpy(mesh.colors, colors.data(), sizeof(unsigned char) * colors.size());
 
     UploadMesh(&mesh, false);
     return LoadModelFromMesh(mesh);

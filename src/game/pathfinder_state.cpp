@@ -67,6 +67,7 @@ struct StateButton {
 PathfinderState::PathfinderState() {
     memset(&m_truckModel, 0, sizeof(Model));
     memset(&m_schoolModel, 0, sizeof(Model));
+    memset(&m_tentModel, 0, sizeof(Model));
 }
 
 PathfinderState::~PathfinderState() {
@@ -196,8 +197,11 @@ void PathfinderState::Init() {
     m_schoolModel = LoadModel("assets/low_poly_school/scene.gltf");
     m_schoolLoaded = (m_schoolModel.meshCount > 0);
 
-    TraceLog(LOG_INFO, "Models loaded: Truck=%d meshes, School=%d meshes",
-             m_truckModel.meshCount, m_schoolModel.meshCount);
+    m_tentModel = LoadModel("assets/low_poly_camping_tent_3/scene.gltf");
+    m_tentLoaded = (m_tentModel.meshCount > 0);
+
+    TraceLog(LOG_INFO, "Models loaded: Truck=%d meshes, School=%d meshes, Tent=%d meshes",
+             m_truckModel.meshCount, m_schoolModel.meshCount, m_tentModel.meshCount);
 
     // 3. Initialize 3D Camera for Google Maps navigation mode
     m_camera.position = (Vector3){0.0f, 25.0f, 25.0f};
@@ -225,6 +229,10 @@ void PathfinderState::Cleanup() {
         UnloadModel(m_schoolModel);
         m_schoolLoaded = false;
     }
+    if (m_tentLoaded) {
+        UnloadModel(m_tentModel);
+        m_tentLoaded = false;
+    }
     m_world.Cleanup();
 }
 
@@ -235,8 +243,170 @@ void PathfinderState::UnloadRouteModels() {
             m_pathfinder.UnloadPathModel(leg.borderModel);
             leg.modelsLoaded = false;
         }
+        if (leg.origModelLoaded) {
+            m_pathfinder.UnloadPathModel(leg.origBlockedModel);
+            leg.origModelLoaded = false;
+        }
     }
     m_routeLegs.clear();
+}
+
+bool PathfinderState::IsGridInTraffic(Vector2 gPos) const {
+    if (!m_trafficEnabled) return false;
+    for (const auto& tz : m_trafficZones) {
+        if (Vector2Distance(gPos, tz.centerGrid) <= tz.radiusGrid) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void PathfinderState::GenerateObstaclesAndTraffic() {
+    m_obstacles.clear();
+    m_blockedRoadCells.clear();
+    m_trafficZones.clear();
+    m_trafficRoadCells.clear();
+
+    if (m_schools.empty()) return;
+
+    // 1. Generate Traffic Congestion Zones (Area Pasar & Simpang Sibuk)
+    Vector2 schoolMid = m_schools[0].gridPos;
+    if (m_schools.size() >= 2) {
+        schoolMid = Vector2Scale(Vector2Add(m_schools[0].gridPos, m_schools[1].gridPos), 0.5f);
+    }
+
+    Vector2 tz1Center = m_world.GetRandomRoadPosition();
+    for (int attempts = 0; attempts < 150; attempts++) {
+        Vector2 cand = m_world.GetRandomRoadPosition();
+        if (m_world.AreConnected(m_carStartGridPos, cand) && Vector2Distance(cand, schoolMid) < 32.0f) {
+            tz1Center = cand;
+            break;
+        }
+    }
+
+    TrafficZone tz1;
+    tz1.id = 1;
+    tz1.name = "Kawasan Pasar & Pertokoan (Macet)";
+    tz1.centerGrid = tz1Center;
+    tz1.centerWorld = m_world.GridToWorld(tz1Center.x, tz1Center.y, 0.0f);
+    tz1.radiusGrid = 10.0f;
+    m_trafficZones.push_back(tz1);
+
+    Vector2 tz2Center = m_world.GetRandomRoadPosition();
+    for (int attempts = 0; attempts < 150; attempts++) {
+        Vector2 cand = m_world.GetRandomRoadPosition();
+        if (m_world.AreConnected(m_carStartGridPos, cand) && Vector2Distance(cand, tz1Center) > 28.0f) {
+            tz2Center = cand;
+            break;
+        }
+    }
+
+    TrafficZone tz2;
+    tz2.id = 2;
+    tz2.name = "Simpang Padat Jam Sibuk";
+    tz2.centerGrid = tz2Center;
+    tz2.centerWorld = m_world.GridToWorld(tz2Center.x, tz2Center.y, 0.0f);
+    tz2.radiusGrid = 9.0f;
+    m_trafficZones.push_back(tz2);
+
+    // Populate m_trafficRoadCells
+    for (int y = 0; y < m_world.GetGridHeight(); y++) {
+        for (int x = 0; x < m_world.GetGridWidth(); x++) {
+            if (m_world.IsWalkable(x, y)) {
+                Vector2 gp = {(float)x, (float)y};
+                if (Vector2Distance(gp, tz1.centerGrid) <= tz1.radiusGrid ||
+                    Vector2Distance(gp, tz2.centerGrid) <= tz2.radiusGrid) {
+                    m_trafficRoadCells.push_back(gp);
+                }
+            }
+        }
+    }
+
+    // 2. Generate Road Obstacles (Tenda Acara Warga / Hajatan di Jalan)
+    // Find candidate along baseline shortest path between SPPG and School 1
+    PathResult directP = m_pathfinder.FindShortestPath(m_world, m_carStartGridPos, m_schools[0].gridPos, ALGO_ASTAR);
+    if (directP.found && directP.gridPath.size() > 14) {
+        for (int offset = 0; offset < 8; offset++) {
+            size_t idx = (directP.gridPath.size() * (35 + offset * 5)) / 100;
+            Vector2 cand = directP.gridPath[idx];
+
+            Vector2 pPrev = (idx > 0) ? directP.gridPath[idx - 1] : directP.gridPath[idx];
+            Vector2 pNext = (idx + 1 < directP.gridPath.size()) ? directP.gridPath[idx + 1] : directP.gridPath[idx];
+            Vector2 roadDir = Vector2Normalize(Vector2Subtract(pNext, pPrev));
+            Vector2 perp = {-roadDir.y, roadDir.x};
+
+            std::vector<Vector2> blockCandidate = {cand};
+            Vector2 perpN1 = {roundf(cand.x + perp.x), roundf(cand.y + perp.y)};
+            Vector2 perpN2 = {roundf(cand.x - perp.x), roundf(cand.y - perp.y)};
+            if (m_world.IsWalkable((int)perpN1.x, (int)perpN1.y)) {
+                blockCandidate.push_back(perpN1);
+            }
+            if (m_world.IsWalkable((int)perpN2.x, (int)perpN2.y)) {
+                blockCandidate.push_back(perpN2);
+            }
+
+            // Verify detour exists for all schools
+            bool allReachable = true;
+            for (const auto& sch : m_schools) {
+                PathResult tp = m_pathfinder.FindShortestPath(m_world, m_carStartGridPos, sch.gridPos, ALGO_ASTAR, blockCandidate);
+                if (!tp.found) {
+                    allReachable = false;
+                    break;
+                }
+            }
+
+            if (allReachable) {
+                float rotDeg = atan2f(roadDir.x, roadDir.y) * RAD2DEG;
+
+                RoadObstacle obs1;
+                obs1.id = 1;
+                obs1.type = OBSTACLE_TENT;
+                obs1.name = "Tenda Acara Warga (Hajatan)";
+                obs1.gridPos = cand;
+                obs1.worldPos = m_world.GridToWorld(cand.x, cand.y, 0.02f);
+                obs1.rotationDeg = rotDeg;
+                m_obstacles.push_back(obs1);
+
+                for (const auto& bCell : blockCandidate) {
+                    m_blockedRoadCells.push_back(bCell);
+                }
+                break;
+            }
+        }
+    }
+
+    // Obstacle 2: Road work construction
+    if (m_schools.size() >= 2) {
+        PathResult p2 = m_pathfinder.FindShortestPath(m_world, m_schools[0].gridPos, m_schools.back().gridPos, ALGO_ASTAR, m_blockedRoadCells);
+        if (p2.found && p2.gridPath.size() > 14) {
+            size_t idx2 = (p2.gridPath.size() * 55) / 100;
+            Vector2 cand2 = p2.gridPath[idx2];
+
+            std::vector<Vector2> testBlocked = m_blockedRoadCells;
+            testBlocked.push_back(cand2);
+
+            bool allReachable = true;
+            for (const auto& sch : m_schools) {
+                PathResult tp = m_pathfinder.FindShortestPath(m_world, m_carStartGridPos, sch.gridPos, ALGO_ASTAR, testBlocked);
+                if (!tp.found) {
+                    allReachable = false;
+                    break;
+                }
+            }
+
+            if (allReachable) {
+                RoadObstacle obs2;
+                obs2.id = 2;
+                obs2.type = OBSTACLE_CONSTRUCTION;
+                obs2.name = "Proyek Drainase & Jalan";
+                obs2.gridPos = cand2;
+                obs2.worldPos = m_world.GridToWorld(cand2.x, cand2.y, 0.0f);
+                m_obstacles.push_back(obs2);
+
+                m_blockedRoadCells.push_back(cand2);
+            }
+        }
+    }
 }
 
 // =============================================================================
@@ -308,7 +478,15 @@ void PathfinderState::RandomizePositions() {
         m_schools.push_back(sch);
     }
 
-    // 4. Run MBG Routing Algorithm (Graph + Dijkstra + DP Modified / Baseline)
+    // 4. Generate Road Obstacles (Tenda) & Traffic Congestion Zones
+    GenerateObstaclesAndTraffic();
+
+    // Reset Realistic Delivery Clock (07:15:00 WIB = 26100 detik) & Speed
+    m_simClockSeconds = 26100.0;
+    m_carCurrentSpeedKmh = 45.0f;
+    m_carTargetSpeedKmh = 45.0f;
+
+    // 5. Run MBG Routing Algorithm (Graph + Dijkstra + DP Modified / Baseline)
     OptimizeAndBuildRoutes();
 
     m_isDriving = true;
@@ -363,13 +541,20 @@ void PathfinderState::OptimizeAndBuildRoutes() {
     std::map<std::pair<int, int>, PathResult> pathCache;
     Graph g;
 
+    const auto& blocked = m_obstaclesEnabled ? m_blockedRoadCells : std::vector<Vector2>{};
+    const auto& traffic = m_trafficEnabled ? m_trafficRoadCells : std::vector<Vector2>{};
+
     for (int i = 0; i < totalLocs; i++) {
         for (int j = i + 1; j < totalLocs; j++) {
-            PathResult p = m_pathfinder.FindShortestPath(m_world, locations[i].gridPos, locations[j].gridPos, m_gridPathAlgo);
+            PathResult p = m_pathfinder.FindShortestPath(m_world, locations[i].gridPos, locations[j].gridPos, m_gridPathAlgo, blocked, traffic);
             pathCache[{locations[i].id, locations[j].id}] = p;
 
-            // Travel time in simulation minutes: 1 world distance unit ~ 0.4 minute
-            int weight = std::max(1, (int)roundf(p.totalDistanceWorld * 0.40f));
+            // Travel time in simulation minutes: 1 world distance unit ~ 0.40 minute + traffic delay!
+            float travelMins = p.totalDistanceWorld * 0.40f;
+            if (m_trafficEnabled) {
+                travelMins += p.trafficDelayMinutes;
+            }
+            int weight = std::max(1, (int)roundf(travelMins));
             g.addEdge(locations[i].id, locations[j].id, weight, false);
         }
     }
@@ -452,6 +637,9 @@ void PathfinderState::OptimizeAndBuildRoutes() {
         leg.color = m_schools[i].color;
         leg.isReturnToDepot = false;
 
+        Vector2 startPos = (prevId == 0) ? m_carStartGridPos : m_schools[i - 1].gridPos;
+        Vector2 goalPos = m_schools[i].gridPos;
+
         // Retrieve road path from cache or compute
         std::pair<int, int> key1 = {prevId, curId};
         std::pair<int, int> key2 = {curId, prevId};
@@ -462,9 +650,64 @@ void PathfinderState::OptimizeAndBuildRoutes() {
             leg.path = pathCache[key2];
             std::reverse(leg.path.gridPath.begin(), leg.path.gridPath.end());
             std::reverse(leg.path.worldWaypoints.begin(), leg.path.worldWaypoints.end());
+            std::reverse(leg.path.waypointInTraffic.begin(), leg.path.waypointInTraffic.end());
         } else {
-            Vector2 startPos = (prevId == 0) ? m_carStartGridPos : m_schools[i - 1].gridPos;
-            leg.path = m_pathfinder.FindShortestPath(m_world, startPos, m_schools[i].gridPos, m_gridPathAlgo);
+            leg.path = m_pathfinder.FindShortestPath(m_world, startPos, goalPos, m_gridPathAlgo, blocked, traffic);
+        }
+
+        // Compute original intended path (WITHOUT road blockades/tents)
+        PathResult origPath = m_pathfinder.FindShortestPath(m_world, startPos, goalPos, m_gridPathAlgo, {}, traffic);
+        leg.originalPath = origPath;
+        leg.originalDistanceKm = origPath.totalDistanceWorld * 0.045f;
+        leg.detourDistanceKm = leg.path.totalDistanceWorld * 0.045f;
+
+        // Detect if detour is taken
+        bool isDifferent = (origPath.gridPath.size() != leg.path.gridPath.size());
+        if (!isDifferent) {
+            for (size_t k = 0; k < origPath.gridPath.size(); k++) {
+                if (origPath.gridPath[k].x != leg.path.gridPath[k].x ||
+                    origPath.gridPath[k].y != leg.path.gridPath[k].y) {
+                    isDifferent = true;
+                    break;
+                }
+            }
+        }
+
+        leg.hasDetour = (m_obstaclesEnabled && isDifferent);
+        if (leg.hasDetour) {
+            leg.extraDetourKm = std::max(0.0f, leg.detourDistanceKm - leg.originalDistanceKm);
+            leg.extraDetourMinutes = leg.extraDetourKm * 2.5f;
+
+            // Find branch point (where detour diverges from original path)
+            size_t branchIdx = 0;
+            while (branchIdx < leg.path.gridPath.size() && branchIdx < origPath.gridPath.size() &&
+                   leg.path.gridPath[branchIdx].x == origPath.gridPath[branchIdx].x &&
+                   leg.path.gridPath[branchIdx].y == origPath.gridPath[branchIdx].y) {
+                branchIdx++;
+            }
+            if (branchIdx > 0 && branchIdx <= leg.path.gridPath.size()) {
+                leg.detourBranchGrid = leg.path.gridPath[branchIdx - 1];
+            }
+
+            // Find merge point (where detour rejoins original path)
+            int endDetour = (int)leg.path.gridPath.size() - 1;
+            int endOrig = (int)origPath.gridPath.size() - 1;
+            while (endDetour >= 0 && endOrig >= 0 &&
+                   leg.path.gridPath[endDetour].x == origPath.gridPath[endOrig].x &&
+                   leg.path.gridPath[endDetour].y == origPath.gridPath[endOrig].y) {
+                endDetour--;
+                endOrig--;
+            }
+            if (endDetour + 1 < (int)leg.path.gridPath.size()) {
+                leg.detourMergeGrid = leg.path.gridPath[endDetour + 1];
+            }
+
+            // Build 3D hazard-striped ribbon for the original blocked route
+            if (origPath.found && origPath.gridPath.size() >= 2) {
+                leg.origBlockedModel = m_pathfinder.BuildPathMeshModel(
+                    m_world, origPath.gridPath, (Color){230, 45, 45, 200}, {}, 0.40f, 0.09f, false, true);
+                leg.origModelLoaded = true;
+            }
         }
 
         m_totalRouteDistance += leg.path.totalDistanceWorld;
@@ -473,9 +716,9 @@ void PathfinderState::OptimizeAndBuildRoutes() {
 
         if (leg.path.found && leg.path.gridPath.size() >= 2) {
             // 1. Crisp white underlay border
-            leg.borderModel = m_pathfinder.BuildPathMeshModel(m_world, leg.path.gridPath, 0.70f, 0.08f);
-            // 2. Core colored ribbon for this school leg!
-            leg.pathModel = m_pathfinder.BuildPathMeshModel(m_world, leg.path.gridPath, 0.48f, 0.14f);
+            leg.borderModel = m_pathfinder.BuildPathMeshModel(m_world, leg.path.gridPath, WHITE, leg.path.waypointInTraffic, 0.70f, 0.08f, true);
+            // 2. Core colored ribbon for this school leg (traffic = RED, clear = leg.color)
+            leg.pathModel = m_pathfinder.BuildPathMeshModel(m_world, leg.path.gridPath, leg.color, leg.path.waypointInTraffic, 0.48f, 0.14f, false);
             leg.modelsLoaded = true;
         }
 
@@ -496,6 +739,9 @@ void PathfinderState::OptimizeAndBuildRoutes() {
         returnLeg.color = (Color){255, 185, 0, 255}; // Vibrant Amber/Gold matching SPPG
         returnLeg.isReturnToDepot = true;
 
+        Vector2 startPos = m_schools.back().gridPos;
+        Vector2 goalPos = m_carStartGridPos;
+
         std::pair<int, int> key1 = {lastSchoolId, 0};
         std::pair<int, int> key2 = {0, lastSchoolId};
 
@@ -505,8 +751,36 @@ void PathfinderState::OptimizeAndBuildRoutes() {
             returnLeg.path = pathCache[key2];
             std::reverse(returnLeg.path.gridPath.begin(), returnLeg.path.gridPath.end());
             std::reverse(returnLeg.path.worldWaypoints.begin(), returnLeg.path.worldWaypoints.end());
+            std::reverse(returnLeg.path.waypointInTraffic.begin(), returnLeg.path.waypointInTraffic.end());
         } else {
-            returnLeg.path = m_pathfinder.FindShortestPath(m_world, m_schools.back().gridPos, m_carStartGridPos, m_gridPathAlgo);
+            returnLeg.path = m_pathfinder.FindShortestPath(m_world, startPos, goalPos, m_gridPathAlgo, blocked, traffic);
+        }
+
+        // Check detour on return leg
+        PathResult origRetPath = m_pathfinder.FindShortestPath(m_world, startPos, goalPos, m_gridPathAlgo, {}, traffic);
+        returnLeg.originalPath = origRetPath;
+        returnLeg.originalDistanceKm = origRetPath.totalDistanceWorld * 0.045f;
+        returnLeg.detourDistanceKm = returnLeg.path.totalDistanceWorld * 0.045f;
+
+        bool retDiff = (origRetPath.gridPath.size() != returnLeg.path.gridPath.size());
+        if (!retDiff) {
+            for (size_t k = 0; k < origRetPath.gridPath.size(); k++) {
+                if (origRetPath.gridPath[k].x != returnLeg.path.gridPath[k].x ||
+                    origRetPath.gridPath[k].y != returnLeg.path.gridPath[k].y) {
+                    retDiff = true;
+                    break;
+                }
+            }
+        }
+        returnLeg.hasDetour = (m_obstaclesEnabled && retDiff);
+        if (returnLeg.hasDetour) {
+            returnLeg.extraDetourKm = std::max(0.0f, returnLeg.detourDistanceKm - returnLeg.originalDistanceKm);
+            returnLeg.extraDetourMinutes = returnLeg.extraDetourKm * 2.5f;
+            if (origRetPath.found && origRetPath.gridPath.size() >= 2) {
+                returnLeg.origBlockedModel = m_pathfinder.BuildPathMeshModel(
+                    m_world, origRetPath.gridPath, (Color){230, 45, 45, 200}, {}, 0.40f, 0.09f, false, true);
+                returnLeg.origModelLoaded = true;
+            }
         }
 
         m_totalRouteDistance += returnLeg.path.totalDistanceWorld;
@@ -514,13 +788,30 @@ void PathfinderState::OptimizeAndBuildRoutes() {
         m_totalExecutionTimeMs += returnLeg.path.executionTimeMs;
 
         if (returnLeg.path.found && returnLeg.path.gridPath.size() >= 2) {
-            returnLeg.borderModel = m_pathfinder.BuildPathMeshModel(m_world, returnLeg.path.gridPath, 0.70f, 0.08f);
-            returnLeg.pathModel = m_pathfinder.BuildPathMeshModel(m_world, returnLeg.path.gridPath, 0.48f, 0.14f);
+            returnLeg.borderModel = m_pathfinder.BuildPathMeshModel(m_world, returnLeg.path.gridPath, WHITE, returnLeg.path.waypointInTraffic, 0.70f, 0.08f, true);
+            returnLeg.pathModel = m_pathfinder.BuildPathMeshModel(m_world, returnLeg.path.gridPath, returnLeg.color, returnLeg.path.waypointInTraffic, 0.48f, 0.14f, false);
             returnLeg.modelsLoaded = true;
         }
 
         m_routeLegs.push_back(returnLeg);
         m_optimizationLog += " → [Akhir] SPPG (Kembali ke Titik Awal)";
+    }
+
+    // Preserve car driving progress on current leg if car was already moving
+    if (m_currentLegIndex >= 0 && m_currentLegIndex < (int)m_routeLegs.size()) {
+        const auto& leg = m_routeLegs[m_currentLegIndex];
+        if (leg.path.found && !leg.path.worldWaypoints.empty()) {
+            float bestDist = 1e9f;
+            int bestIdx = 0;
+            for (size_t w = 0; w < leg.path.worldWaypoints.size(); w++) {
+                float d = Vector3Distance(m_carCurrentPos, leg.path.worldWaypoints[w]);
+                if (d < bestDist) {
+                    bestDist = d;
+                    bestIdx = (int)w;
+                }
+            }
+            m_legDriveProgress = (float)bestIdx;
+        }
     }
 
     UpdateNavigationStatus();
@@ -531,6 +822,8 @@ void PathfinderState::UpdateNavigationStatus() {
         m_turnInstruction = "Selesai!";
         m_distanceToCurrentTarget = 0.0f;
         m_totalDistanceRemaining = 0.0f;
+        m_realisticEtaMinutes = 0.0f;
+        m_trafficDelayMinutes = 0.0f;
         return;
     }
 
@@ -543,19 +836,42 @@ void PathfinderState::UpdateNavigationStatus() {
     if (!curLeg.path.found || curLeg.path.worldWaypoints.size() < 2) {
         m_turnInstruction = "Mencari Rute...";
         m_distanceToCurrentTarget = 0.0f;
+        m_realisticEtaMinutes = 0.0f;
         return;
     }
 
-    // Distance remaining on current leg
+    // Distance remaining on current leg and traffic congestion distance
     int curIdx = (int)m_legDriveProgress;
     float distLeg = 0.0f;
+    float trafficDistLeg = 0.0f;
+
     if (curIdx < (int)curLeg.path.worldWaypoints.size()) {
-        distLeg += Vector3Distance(m_carCurrentPos, curLeg.path.worldWaypoints[curIdx]);
+        float d0 = Vector3Distance(m_carCurrentPos, curLeg.path.worldWaypoints[curIdx]);
+        distLeg += d0;
+        if (curIdx < (int)curLeg.path.waypointInTraffic.size() && curLeg.path.waypointInTraffic[curIdx]) {
+            trafficDistLeg += d0;
+        }
         for (size_t i = curIdx + 1; i < curLeg.path.worldWaypoints.size(); i++) {
-            distLeg += Vector3Distance(curLeg.path.worldWaypoints[i - 1], curLeg.path.worldWaypoints[i]);
+            float seg = Vector3Distance(curLeg.path.worldWaypoints[i - 1], curLeg.path.worldWaypoints[i]);
+            distLeg += seg;
+            if (i < curLeg.path.waypointInTraffic.size() && curLeg.path.waypointInTraffic[i]) {
+                trafficDistLeg += seg;
+            }
         }
     }
     m_distanceToCurrentTarget = distLeg;
+
+    // Realistic delivery ETA calculation in minutes
+    // Free distance at ~45 km/h (12.5 m/s) + Traffic distance at ~12 km/h (3.3 m/s)
+    float freeMeters = std::max(0.0f, (distLeg - trafficDistLeg) * 25.0f);
+    float trafficMeters = trafficDistLeg * 25.0f;
+
+    float freeTravelSecs = freeMeters / 12.5f;
+    float trafficTravelSecs = trafficMeters / 3.3f;
+    m_trafficDelayMinutes = (m_trafficEnabled ? (trafficTravelSecs - (trafficMeters / 12.5f)) : 0.0f) / 60.0f;
+
+    float totalSecs = freeTravelSecs + (m_trafficEnabled ? trafficTravelSecs : (trafficMeters / 12.5f));
+    m_realisticEtaMinutes = std::max(1.0f, ceilf(totalSecs / 60.0f));
 
     // Total distance across all remaining unvisited legs
     float totalRem = distLeg;
@@ -594,9 +910,35 @@ void PathfinderState::UpdateCarDriving(float dt) {
         return;
     }
 
+    // Advance realistic simulation clock (1 real second = 15 sim seconds * multiplier)
+    m_simClockSeconds += (double)(dt * 15.0f * m_simSpeedMultiplier);
+
+    // Detect if current car position is inside a traffic congestion zone
+    Vector2 curCarGrid = m_world.WorldToGrid(m_carCurrentPos);
+    m_isCarInTraffic = m_trafficEnabled && IsGridInTraffic(curCarGrid);
+
+    // Realistic vehicle speed (km/h) simulation
+    if (m_isUnloading) {
+        m_carTargetSpeedKmh = 0.0f;
+        m_speedStatusStr = "Bongkar Muatan (0 km/j)";
+    } else if (m_isCarInTraffic) {
+        m_carTargetSpeedKmh = 12.0f; // Macet padat merayap
+        m_speedStatusStr = "Macet Parah (12 km/j)";
+    } else {
+        bool nearTurn = (m_turnInstruction.find("Belok") != std::string::npos);
+        m_carTargetSpeedKmh = nearTurn ? 24.0f : 48.0f;
+        m_speedStatusStr = nearTurn ? "Menikung (24 km/j)" : "Lancar (48 km/j)";
+    }
+
+    // Smooth speed interpolation (acceleration / deceleration)
+    m_carCurrentSpeedKmh = Lerp(m_carCurrentSpeedKmh, m_carTargetSpeedKmh, 3.5f * dt);
+
+    // Dynamic movement speed scaled by km/h and simulation speed multiplier
+    m_driveSpeed = (m_carCurrentSpeedKmh / 45.0f) * 10.5f * m_simSpeedMultiplier;
+
     // Handle unloading simulation at school
     if (m_isUnloading) {
-        m_unloadTimer -= dt;
+        m_unloadTimer -= dt * m_simSpeedMultiplier;
         if (m_unloadTimer <= 0.0f) {
             m_isUnloading = false;
             // Transition to next leg (could be next school OR return to SPPG!)
@@ -633,7 +975,7 @@ void PathfinderState::UpdateCarDriving(float dt) {
             m_allDelivered = true;
             m_distanceToCurrentTarget = 0.0f;
             m_totalDistanceRemaining = 0.0f;
-            m_arrivalTimer += dt;
+            m_arrivalTimer += dt * m_simSpeedMultiplier;
             if (m_arrivalTimer >= 4.0f) {
                 RandomizePositions(); // Automatically starts next delivery mission!
             }
@@ -742,6 +1084,22 @@ void PathfinderState::Update() {
         m_mapPan = {0, 0};
     }
     if (IsKeyPressed(KEY_H)) m_showMinimap = !m_showMinimap;
+    if (IsKeyPressed(KEY_O)) {
+        m_obstaclesEnabled = !m_obstaclesEnabled;
+        OptimizeAndBuildRoutes();
+    }
+    if (IsKeyPressed(KEY_T)) {
+        m_trafficEnabled = !m_trafficEnabled;
+        OptimizeAndBuildRoutes();
+    }
+    if (IsKeyPressed(KEY_B)) {
+        m_showOriginalRoute = !m_showOriginalRoute;
+    }
+    if (IsKeyPressed(KEY_X)) {
+        if (m_simSpeedMultiplier == 1.0f) m_simSpeedMultiplier = 2.0f;
+        else if (m_simSpeedMultiplier == 2.0f) m_simSpeedMultiplier = 4.0f;
+        else m_simSpeedMultiplier = 1.0f;
+    }
 
     // Adjust school count via keyboard '+' and '-' (3 to 5)
     if (IsKeyPressed(KEY_EQUAL) || IsKeyPressed(KEY_KP_ADD)) {
@@ -786,21 +1144,38 @@ void PathfinderState::DrawDirty() {
     // 1. Procedural 3D City with baked Ambient Occlusion
     m_world.Draw3D(m_showLidar);
 
-    // 2. Draw Multi-School Colored Route Lines (Each leg has its own distinct color!)
+    // 2. Draw Multi-School Route Lines (Traffic segments are colored RED!)
+    // First, draw the Original Blocked Path (Jalur Semestinya) if enabled
+    if (m_obstaclesEnabled && m_showOriginalRoute) {
+        for (const auto& leg : m_routeLegs) {
+            if (leg.hasDetour && leg.origModelLoaded) {
+                DrawModel(leg.origBlockedModel, {0, 0, 0}, 1.0f, WHITE);
+            }
+        }
+    }
+
+    // Draw 3D Detour Branch Indicators where dynamic detour diverges from original path
+    if (m_obstaclesEnabled) {
+        for (const auto& leg : m_routeLegs) {
+            if (!leg.hasDetour) continue;
+            Vector3 branchW = m_world.GridToWorld(leg.detourBranchGrid.x, leg.detourBranchGrid.y, 0.08f);
+
+            // Glowing green detour ring & marker on pavement
+            float dPulse = 1.1f + 0.25f * sinf(m_pulseTimer * 5.0f);
+            DrawCircle3D(branchW, dPulse, (Vector3){1, 0, 0}, 90.0f, Fade((Color){40, 225, 90, 255}, 0.55f));
+            DrawSphere(Vector3Add(branchW, (Vector3){0, 1.2f, 0}), 0.28f, (Color){40, 225, 90, 255});
+            DrawCylinder(Vector3Add(branchW, (Vector3){0, 0.5f, 0}), 0.06f, 0.06f, 1.0f, 6, WHITE);
+        }
+    }
+
+    // Then draw the Active Dynamic Detour Routes
     for (size_t i = 0; i < m_routeLegs.size(); i++) {
         const auto& leg = m_routeLegs[i];
         if (!leg.modelsLoaded) continue;
 
-        // Crisp white underlay border
-        DrawModel(leg.borderModel, {0, 0, 0}, 1.0f, (Color){255, 255, 255, 240});
-
-        // Core ribbon in this school's unique color (Blue, Green, Orange, etc.)
-        Color ribbonCol = leg.color;
-        if (leg.targetSchoolIndex < m_currentLegIndex) {
-            // Already visited legs are slightly softened
-            ribbonCol = Fade(leg.color, 0.65f);
-        }
-        DrawModel(leg.pathModel, {0, 0, 0}, 1.0f, ribbonCol);
+        Color tint = (leg.targetSchoolIndex < m_currentLegIndex) ? Fade(WHITE, 0.60f) : WHITE;
+        DrawModel(leg.borderModel, {0, 0, 0}, 1.0f, tint);
+        DrawModel(leg.pathModel, {0, 0, 0}, 1.0f, tint);
     }
 
     // 3. Draw SPPG (Dapur Pusat / Kitchen) 3D Marker Pin
@@ -852,7 +1227,64 @@ void PathfinderState::DrawDirty() {
         DrawCircle3D(Vector3Add(schRenderPos, (Vector3){0, 0.05f, 0}), ringRadius, (Vector3){1, 0, 0}, 90.0f, Fade(pinCol, 0.35f));
     }
 
-    // 6. Draw 3D LIDAR sensor rays cast from vehicle
+    // 6. Draw 3D Road Obstacles (Tenda Acara Warga di Tengah Jalan & Perbaikan Jalan)
+    if (m_obstaclesEnabled) {
+        for (const auto& obs : m_obstacles) {
+            if (obs.type == OBSTACLE_TENT && m_tentLoaded) {
+                // Direction vectors of the road at the tent
+                float rad = obs.rotationDeg * DEG2RAD;
+                Vector3 roadFwd = {sinf(rad), 0, cosf(rad)};
+                Vector3 roadPerp = {-cosf(rad), 0, sinf(rad)};
+
+                // 1. Draw 3D International "No Entry / Road Closed" ⛔ decal on the asphalt road surface
+                DrawCircle3D(Vector3Add(obs.worldPos, (Vector3){0, 0.05f, 0}), 1.6f, (Vector3){1, 0, 0}, 90.0f, Fade((Color){230, 35, 35, 255}, 0.75f));
+                DrawCube(Vector3Add(obs.worldPos, (Vector3){0, 0.06f, 0}), 1.3f, 0.02f, 0.32f, WHITE);
+
+                // 2. Draw 3D Tent Model centered directly in the middle of the road
+                float tentScale = 0.24f;
+                DrawModelEx(m_tentModel, obs.worldPos, (Vector3){0, 1, 0}, obs.rotationDeg,
+                            (Vector3){tentScale, tentScale, tentScale}, WHITE);
+
+                // 3. Barricade posts on left and right sides of the road (blocking passage past tent)
+                Vector3 postL = Vector3Add(obs.worldPos, Vector3Scale(roadPerp, 0.70f));
+                Vector3 postR = Vector3Subtract(obs.worldPos, Vector3Scale(roadPerp, 0.70f));
+                DrawCylinder(postL, 0.08f, 0.08f, 0.70f, 8, (Color){240, 120, 0, 255});
+                DrawCylinder(postR, 0.08f, 0.08f, 0.70f, 8, (Color){240, 120, 0, 255});
+                DrawCylinder(postL, 0.09f, 0.09f, 0.20f, 8, WHITE);
+                DrawCylinder(postR, 0.09f, 0.09f, 0.20f, 8, WHITE);
+
+                // 4. Safety traffic cones in front and behind the tent along the blocked road
+                Vector3 coneFront = Vector3Add(obs.worldPos, Vector3Scale(roadFwd, 1.30f));
+                Vector3 coneBack  = Vector3Subtract(obs.worldPos, Vector3Scale(roadFwd, 1.30f));
+                DrawCylinder(Vector3Add(coneFront, (Vector3){0, 0.16f, 0}), 0.04f, 0.15f, 0.32f, 8, (Color){255, 120, 0, 255});
+                DrawCylinder(Vector3Add(coneBack, (Vector3){0, 0.16f, 0}), 0.04f, 0.15f, 0.32f, 8, (Color){255, 120, 0, 255});
+
+                // 5. Flashing warning beacon light on top of the tent
+                float beaconPulse = 0.6f + 0.4f * sinf(m_pulseTimer * 8.0f);
+                DrawSphere(Vector3Add(obs.worldPos, (Vector3){0, 1.05f, 0}), 0.20f, Fade((Color){255, 180, 0, 255}, beaconPulse));
+                DrawCircle3D(Vector3Add(obs.worldPos, (Vector3){0, 0.07f, 0}), 2.0f, (Vector3){1, 0, 0}, 90.0f, Fade(RED, 0.35f));
+            } else {
+                // Construction / Road work barricade
+                DrawCube(Vector3Add(obs.worldPos, (Vector3){0, 0.25f, 0}), 0.95f, 0.5f, 0.25f, (Color){255, 120, 0, 255});
+                DrawCubeWires(Vector3Add(obs.worldPos, (Vector3){0, 0.25f, 0}), 0.95f, 0.5f, 0.25f, BLACK);
+
+                float beaconPulse = 0.6f + 0.4f * sinf(m_pulseTimer * 10.0f);
+                DrawSphere(Vector3Add(obs.worldPos, (Vector3){0, 0.65f, 0}), 0.16f, Fade(RED, beaconPulse));
+                DrawCircle3D(Vector3Add(obs.worldPos, (Vector3){0, 0.06f, 0}), 1.2f, (Vector3){1, 0, 0}, 90.0f, Fade(RED, 0.45f));
+            }
+        }
+    }
+
+    // 7. Draw 3D Traffic Congestion Indicators (Ground Halos)
+    if (m_trafficEnabled) {
+        for (const auto& tz : m_trafficZones) {
+            float rPulse = tz.radiusGrid * 0.5f + 0.25f * sinf(m_pulseTimer * 3.0f);
+            DrawCircle3D(Vector3Add(tz.centerWorld, (Vector3){0, 0.05f, 0}), rPulse, (Vector3){1, 0, 0}, 90.0f, Fade(RED, 0.18f));
+            DrawCircle3D(Vector3Add(tz.centerWorld, (Vector3){0, 0.05f, 0}), 1.2f, (Vector3){1, 0, 0}, 90.0f, Fade(RED, 0.40f));
+        }
+    }
+
+    // 8. Draw 3D LIDAR sensor rays cast from vehicle
     if (m_showLidar) {
         Vector3 sensorOrigin = Vector3Add(m_carCurrentPos, (Vector3){0, 0.4f, 0});
         for (const auto& hit : m_lidarHits) {
@@ -881,8 +1313,8 @@ void PathfinderState::DrawUI() {
     // =========================================================================
     int navCardX = 16;
     int navCardY = 14;
-    int navCardW = 420;
-    int navCardH = m_allDelivered ? 96 : 116;
+    int navCardW = 430;
+    int navCardH = m_allDelivered ? 100 : 138;
 
     bool isReturningToDepot = (!m_routeLegs.empty() && m_currentLegIndex < (int)m_routeLegs.size() && m_routeLegs[m_currentLegIndex].isReturnToDepot);
 
@@ -892,69 +1324,85 @@ void PathfinderState::DrawUI() {
                         ((!m_routeLegs.empty() && m_currentLegIndex < (int)m_routeLegs.size()) ?
                          Fade(m_routeLegs[m_currentLegIndex].color, 0.96f) : (Color){26, 115, 232, 250})));
 
-    DrawRectangleRounded((Rectangle){(float)navCardX, (float)navCardY, (float)navCardW, (float)navCardH}, 0.12f, 6, curHeaderBg);
-    DrawRectangleRoundedLinesEx((Rectangle){(float)navCardX, (float)navCardY, (float)navCardW, (float)navCardH}, 0.12f, 6, 2.0f, Fade(WHITE, 0.45f));
+    DrawRectangleRounded((Rectangle){(float)navCardX, (float)navCardY, (float)navCardW, (float)navCardH}, 0.10f, 6, curHeaderBg);
+    DrawRectangleRoundedLinesEx((Rectangle){(float)navCardX, (float)navCardY, (float)navCardW, (float)navCardH}, 0.10f, 6, 2.0f, Fade(WHITE, 0.45f));
+
+    // Calculate realistic simulation clock:
+    int clockSecs = (int)m_simClockSeconds % 86400;
+    int curH = clockSecs / 3600;
+    int curM = (clockSecs % 3600) / 60;
+    int curS = clockSecs % 60;
+
+    int arrSecs = (int)(m_simClockSeconds + m_realisticEtaMinutes * 60.0f) % 86400;
+    int arrH = arrSecs / 3600;
+    int arrM = (arrSecs % 3600) / 60;
+
+    // Top status strip: Clock & Speedometer Badge
+    DrawTextCustom(TextFormat("🕒 %02d:%02d:%02d WIB", curH, curM, curS), navCardX + 18, navCardY + 12, 12.0f, (Color){255, 250, 220, 255}, FONT_BOLD);
+
+    // Speedometer badge
+    int speedVal = (int)roundf(m_carCurrentSpeedKmh);
+    Color speedBadgeBg = m_isUnloading ? (Color){230, 130, 20, 255} :
+                         (m_isCarInTraffic ? (Color){220, 35, 35, 255} :
+                         ((m_speedStatusStr.find("Menikung") != std::string::npos) ? (Color){200, 160, 20, 255} : (Color){34, 180, 80, 255}));
+    const char* speedStatusShort = m_isUnloading ? "BONGKAR" : (m_isCarInTraffic ? "MACET" : ((m_speedStatusStr.find("Menikung") != std::string::npos) ? "TIKUNGAN" : "LANCAR"));
+    const char* speedText = TextFormat("%d KM/J • %s", speedVal, speedStatusShort);
+    float spdW = MeasureTextCustom(speedText, 10.5f, FONT_BOLD) + 16;
+    DrawRectangleRounded((Rectangle){navCardX + navCardW - spdW - 14, (float)navCardY + 9, spdW, 20}, 0.35f, 4, speedBadgeBg);
+    DrawTextCustom(speedText, navCardX + navCardW - spdW - 6, navCardY + 13, 10.5f, WHITE, FONT_BOLD);
+
+    DrawLine(navCardX + 16, navCardY + 34, navCardX + navCardW - 16, navCardY + 34, Fade(WHITE, 0.25f));
 
     if (m_allDelivered) {
-        DrawTextCustom("MISI MBG SELESAI!", navCardX + 22, navCardY + 18, 20, WHITE, FONT_BOLD);
-        DrawTextCustom(TextFormat("Seluruh %d sekolah terlayani & mobil kembali ke titik awal (SPPG)!", (int)m_schools.size()),
-                       navCardX + 22, navCardY + 48, 12.5f, (Color){220, 255, 230, 255}, FONT_REGULAR);
-        DrawTextCustom("Memulai misi baru dalam 4 detik...", navCardX + 22, navCardY + 68, 11.5f, (Color){200, 240, 210, 255}, FONT_REGULAR);
+        DrawTextCustom("MISI PENGANTARAN SELESAI!", navCardX + 20, navCardY + 44, 17, WHITE, FONT_BOLD);
+        DrawTextCustom(TextFormat("Seluruh %d sekolah terlayani & mobil kembali ke SPPG tepat waktu!", (int)m_schools.size()),
+                       navCardX + 20, navCardY + 68, 11.5f, (Color){220, 255, 230, 255}, FONT_REGULAR);
     } else if (isReturningToDepot) {
-        // Return to depot header
-        const char* retIcon = "↑";
-        if (m_turnInstruction == "Belok Kanan") retIcon = "→";
-        else if (m_turnInstruction == "Belok Kiri") retIcon = "←";
-        DrawTextCustom(retIcon, navCardX + 26, navCardY + 18, 28, WHITE, FONT_BOLD);
-        DrawTextCustom(m_turnInstruction.c_str(), navCardX + 70, navCardY + 12, 18, WHITE, FONT_BOLD);
-        DrawTextCustom("Langkah Akhir: Kembali ke Titik Awal (SPPG)", navCardX + 70, navCardY + 36, 13, WHITE, FONT_SEMIBOLD);
+        const char* retIcon = (m_turnInstruction.find("Kanan") != std::string::npos) ? "→" :
+                              ((m_turnInstruction.find("Kiri") != std::string::npos) ? "←" : "↑");
+        DrawTextCustom(retIcon, navCardX + 20, navCardY + 44, 26, WHITE, FONT_BOLD);
+        DrawTextCustom(m_turnInstruction.c_str(), navCardX + 58, navCardY + 42, 16.5f, WHITE, FONT_BOLD);
+        DrawTextCustom("Langkah Akhir: Kembali ke Titik Awal (SPPG)", navCardX + 58, navCardY + 63, 11.5f, WHITE, FONT_SEMIBOLD);
 
-        float metersCurrent = m_distanceToCurrentTarget * 4.0f;
-        int etaSeconds = (int)(m_distanceToCurrentTarget / m_driveSpeed);
-        DrawTextCustom(TextFormat("Sisa Jarak ke SPPG: %.0f m (%d dtk) • Menuju Pangkalan", metersCurrent, etaSeconds),
-                       navCardX + 70, navCardY + 58, 12, (Color){255, 255, 180, 255}, FONT_REGULAR);
-        DrawTextCustom("Pengiriman makanan bergizi di seluruh sekolah telah selesai",
-                       navCardX + 70, navCardY + 78, 11, (Color){255, 245, 220, 255}, FONT_REGULAR);
+        float metersCurrent = m_distanceToCurrentTarget * 25.0f;
+        float kmCurrent = metersCurrent / 1000.0f;
+        DrawTextCustom(TextFormat("Jarak: %.2f km (%.0f m) • ETA: %.0f Menit (Tiba ~%02d:%02d WIB)",
+                                  kmCurrent, metersCurrent, m_realisticEtaMinutes, arrH, arrM),
+                       navCardX + 58, navCardY + 82, 11.5f, (Color){255, 255, 180, 255}, FONT_REGULAR);
 
-        DrawCircle(navCardX + navCardW - 20, navCardY + 20, 6, (Color){255, 230, 0, 255});
-        DrawTextCustom("KEMBALI", navCardX + navCardW - 74, navCardY + 15, 9, BLACK, FONT_BOLD);
+        if (m_isCarInTraffic) {
+            DrawTextCustom("🔴 Zona Macet: Kecepatan mobil turun ke 12 km/jam", navCardX + 58, navCardY + 102, 11.0f, (Color){255, 130, 130, 255}, FONT_BOLD);
+        } else {
+            DrawTextCustom("🟢 Menuju pangkalan dapur pusat SPPG", navCardX + 58, navCardY + 102, 11.0f, (Color){230, 255, 220, 255}, FONT_REGULAR);
+        }
     } else {
-        // Navigation icon
-        const char* iconStr = "↑";
-        if (m_turnInstruction == "Belok Kanan") iconStr = "→";
-        else if (m_turnInstruction == "Belok Kiri") iconStr = "←";
-        else if (m_isUnloading) iconStr = "▶";
-        DrawTextCustom(iconStr, navCardX + 26, navCardY + 18, 28, WHITE, FONT_BOLD);
+        const char* iconStr = m_isUnloading ? "▶" :
+                              ((m_turnInstruction.find("Kanan") != std::string::npos) ? "→" :
+                              ((m_turnInstruction.find("Kiri") != std::string::npos) ? "←" : "↑"));
+        DrawTextCustom(iconStr, navCardX + 20, navCardY + 44, 26, WHITE, FONT_BOLD);
+        DrawTextCustom(m_turnInstruction.c_str(), navCardX + 58, navCardY + 42, 16.5f, WHITE, FONT_BOLD);
 
-        // Turn instruction
-        DrawTextCustom(m_turnInstruction.c_str(), navCardX + 70, navCardY + 12, 18, WHITE, FONT_BOLD);
-
-        // Destination with school step indicator
         int targetId = m_currentLegIndex + 1;
         const char* colName = (m_currentLegIndex < 6) ? LEG_COLOR_NAMES[m_currentLegIndex] : "Warna";
         const char* schName = (m_currentLegIndex < (int)m_schools.size()) ? m_schools[m_currentLegIndex].name.c_str() : "Sekolah";
 
         DrawTextCustom(TextFormat("Tujuan: %s (Stop %d dari %d • Jalur %s)", schName, targetId, (int)m_schools.size(), colName),
-                       navCardX + 70, navCardY + 36, 13, WHITE, FONT_SEMIBOLD);
+                       navCardX + 58, navCardY + 63, 11.5f, WHITE, FONT_SEMIBOLD);
 
-        // Distance & ETA
-        float metersCurrent = m_distanceToCurrentTarget * 4.0f;
-        float metersTotal   = m_totalDistanceRemaining * 4.0f;
-        int etaSeconds = (int)(m_distanceToCurrentTarget / m_driveSpeed);
+        float metersCurrent = m_distanceToCurrentTarget * 25.0f;
+        float kmCurrent = metersCurrent / 1000.0f;
+        DrawTextCustom(TextFormat("Jarak: %.2f km (%.0f m) • ETA: %.0f Menit (Tiba ~%02d:%02d WIB)",
+                                  kmCurrent, metersCurrent, m_realisticEtaMinutes, arrH, arrM),
+                       navCardX + 58, navCardY + 82, 11.5f, (Color){255, 255, 180, 255}, FONT_REGULAR);
 
-        DrawTextCustom(TextFormat("Target: %.0f m (%d dtk) • Total Sisa: %.0f m", metersCurrent, etaSeconds, metersTotal),
-                       navCardX + 70, navCardY + 58, 12, (Color){255, 255, 180, 255}, FONT_REGULAR);
-
-        // Time window indicator
-        if (m_currentLegIndex < (int)m_schools.size()) {
+        if (m_isCarInTraffic) {
+            DrawTextCustom(TextFormat("🔴 Zona Macet (+%.0f mnt delay) • Kecepatan 12 km/jam", m_trafficDelayMinutes),
+                           navCardX + 58, navCardY + 102, 11.0f, (Color){255, 140, 140, 255}, FONT_BOLD);
+        } else if (m_currentLegIndex < (int)m_schools.size()) {
             const auto& w = m_schools[m_currentLegIndex].window;
-            DrawTextCustom(TextFormat("Window Pengantaran: [%d - %d menit] • Bongkar: 5m", w.start, w.end),
-                           navCardX + 70, navCardY + 78, 11, (Color){230, 245, 255, 255}, FONT_REGULAR);
+            DrawTextCustom(TextFormat("Window Pengantaran: [%d - %d mnt] • Bongkar: 5m", w.start, w.end),
+                           navCardX + 58, navCardY + 102, 11.0f, (Color){230, 245, 255, 255}, FONT_REGULAR);
         }
-
-        // Pulsing status
-        DrawCircle(navCardX + navCardW - 20, navCardY + 20, 6, m_isUnloading ? ORANGE : RED);
-        DrawTextCustom(m_isUnloading ? "BONGKAR" : "AUTO", navCardX + navCardW - 68, navCardY + 15, 9, WHITE, FONT_BOLD);
     }
 
     // =========================================================================
@@ -964,20 +1412,29 @@ void PathfinderState::DrawUI() {
     int toolY = 14;
 
     bool isModified = (m_routingAlgorithm == ROUTING_DP_MODIFIED);
-    StateButton btnMod      = {{(float)toolX, (float)toolY, 138, 36}, "DP Modified [TAB]", isModified};
-    StateButton btnBaseAlgo = {{(float)toolX + 144, (float)toolY, 120, 36}, "DP Baseline", !isModified};
-    StateButton btnRandomize= {{(float)toolX + 270, (float)toolY, 110, 36}, "Acak Rute [R]", false};
-    StateButton btnDrive    = {{(float)toolX + 386, (float)toolY, 105, 36}, m_isDriving ? "Jeda [SPACE]" : "Auto Jalan", m_isDriving};
-    StateButton btnMap      = {{(float)toolX + 497, (float)toolY, 135, 36}, m_mapFullscreen ? "Tutup Peta [M]" : "Peta Penuh [M]", m_mapFullscreen};
+    StateButton btnMod      = {{(float)toolX, (float)toolY, 136, 36}, "DP Modified [TAB]", isModified};
+    StateButton btnBaseAlgo = {{(float)toolX + 142, (float)toolY, 116, 36}, "DP Baseline", !isModified};
+    StateButton btnRandomize= {{(float)toolX + 264, (float)toolY, 106, 36}, "Acak Rute [R]", false};
+    StateButton btnDrive    = {{(float)toolX + 376, (float)toolY, 104, 36}, m_isDriving ? "Jeda [SPACE]" : "Auto Jalan", m_isDriving};
+    StateButton btnMap      = {{(float)toolX + 486, (float)toolY, 126, 36}, m_mapFullscreen ? "Tutup Peta [M]" : "Peta Penuh [M]", m_mapFullscreen};
 
-    // Row 2 of controls (Schools count + Camera toggle)
+    // Row 2 of controls (Obstacles, Traffic, Simulation Speed, School Count, Camera)
     int row2Y = toolY + 42;
-    StateButton btnMinusSchool = {{(float)toolX, (float)row2Y, 34, 32}, "[-]", false};
-    StateButton btnSchoolCount = {{(float)toolX + 38, (float)row2Y, 86, 32}, TextFormat("%d Sekolah", m_numSchools), true};
-    StateButton btnPlusSchool  = {{(float)toolX + 128, (float)row2Y, 34, 32}, "[+]", false};
+    StateButton btnObstacle = {{(float)toolX, (float)row2Y, 136, 32},
+                              m_obstaclesEnabled ? "Hambatan: ON [O]" : "Hambatan: OFF [O]", m_obstaclesEnabled};
+    StateButton btnTraffic  = {{(float)toolX + 142, (float)row2Y, 116, 32},
+                              m_trafficEnabled ? "Macet: ON [T]" : "Macet: OFF [T]", m_trafficEnabled};
+    StateButton btnSimSpeed = {{(float)toolX + 264, (float)row2Y, 106, 32},
+                              TextFormat("Speed: %.0fx [X]", m_simSpeedMultiplier), m_simSpeedMultiplier > 1.0f};
+    StateButton btnOrigRoute = {{(float)toolX + 376, (float)row2Y, 124, 32},
+                               m_showOriginalRoute ? "Jalur Asli: ON [B]" : "Jalur Asli: OFF [B]", m_showOriginalRoute};
 
-    StateButton btnCam = {{(float)toolX + 168, (float)row2Y, 115, 32},
-                          (m_camMode == APP_CAM_FOLLOW_CAR) ? "Cam: Truk [C]" : "Cam: Sek [S]",
+    StateButton btnMinusSchool = {{(float)toolX + 506, (float)row2Y, 28, 32}, "[-]", false};
+    StateButton btnSchoolCount = {{(float)toolX + 538, (float)row2Y, 70, 32}, TextFormat("%d Sek", m_numSchools), true};
+    StateButton btnPlusSchool  = {{(float)toolX + 612, (float)row2Y, 28, 32}, "[+]", false};
+
+    StateButton btnCam = {{(float)toolX + 646, (float)row2Y, 74, 32},
+                          (m_camMode == APP_CAM_FOLLOW_CAR) ? "Truk [C]" : "Sek [S]",
                           m_camMode == APP_CAM_FOLLOW_CAR};
 
     Color btnBase = {240, 244, 250, 255};
@@ -988,6 +1445,11 @@ void PathfinderState::DrawUI() {
     btnRandomize.Draw(m_fontSemiBold, btnBase, btnHover, LEG_COLORS[1], BLACK);
     btnDrive.Draw(m_fontSemiBold, btnBase, btnHover, {230, 60, 60, 255}, m_isDriving ? WHITE : BLACK);
     btnMap.Draw(m_fontSemiBold, btnBase, btnHover, (Color){30, 144, 255, 255}, m_mapFullscreen ? WHITE : BLACK);
+
+    btnObstacle.Draw(m_fontSemiBold, btnBase, btnHover, (Color){240, 140, 20, 255}, m_obstaclesEnabled ? WHITE : BLACK);
+    btnTraffic.Draw(m_fontSemiBold, btnBase, btnHover, (Color){230, 50, 50, 255}, m_trafficEnabled ? WHITE : BLACK);
+    btnSimSpeed.Draw(m_fontSemiBold, btnBase, btnHover, (Color){40, 180, 80, 255}, m_simSpeedMultiplier > 1.0f ? WHITE : BLACK);
+    btnOrigRoute.Draw(m_fontSemiBold, btnBase, btnHover, (Color){70, 180, 255, 255}, m_showOriginalRoute ? WHITE : BLACK);
 
     btnMinusSchool.Draw(m_fontBold, btnBase, btnHover, {200, 200, 210, 255}, BLACK);
     btnSchoolCount.Draw(m_fontSemiBold, btnBase, btnHover, Fade(LEG_COLORS[1], 0.85f), WHITE);
@@ -1016,6 +1478,22 @@ void PathfinderState::DrawUI() {
             m_mapPan = {0, 0};
         }
     }
+    if (btnObstacle.IsClicked()) {
+        m_obstaclesEnabled = !m_obstaclesEnabled;
+        OptimizeAndBuildRoutes();
+    }
+    if (btnTraffic.IsClicked()) {
+        m_trafficEnabled = !m_trafficEnabled;
+        OptimizeAndBuildRoutes();
+    }
+    if (btnSimSpeed.IsClicked()) {
+        if (m_simSpeedMultiplier == 1.0f) m_simSpeedMultiplier = 2.0f;
+        else if (m_simSpeedMultiplier == 2.0f) m_simSpeedMultiplier = 4.0f;
+        else m_simSpeedMultiplier = 1.0f;
+    }
+    if (btnOrigRoute.IsClicked()) {
+        m_showOriginalRoute = !m_showOriginalRoute;
+    }
     if (btnMinusSchool.IsClicked() && m_numSchools > 3) {
         m_numSchools--;
         RandomizePositions();
@@ -1028,14 +1506,39 @@ void PathfinderState::DrawUI() {
         m_camMode = (m_camMode == APP_CAM_FOLLOW_CAR) ? APP_CAM_FOLLOW_SCHOOL : APP_CAM_FOLLOW_CAR;
     }
 
+    // Detour status banner below toolbar - show when road blockade is active
+    if (m_obstaclesEnabled) {
+        bool anyDetour = false;
+        float extraKm = 0.0f;
+        float extraMin = 0.0f;
+        for (const auto& leg : m_routeLegs) {
+            if (leg.hasDetour) {
+                anyDetour = true;
+                extraKm += leg.extraDetourKm;
+                extraMin += leg.extraDetourMinutes;
+            }
+        }
+        if (anyDetour) {
+            int bannerY = row2Y + 38;
+            float pulse = 0.7f + 0.3f * sinf(m_pulseTimer * 4.0f);
+            DrawRectangleRounded(
+                (Rectangle){(float)toolX, (float)bannerY, 620, 22}, 0.25f, 4,
+                Fade((Color){255, 60, 30, 255}, pulse * 0.92f));
+            const char* detourMsg = TextFormat(
+                "⛔  JALAN DIBLOKADE (Tenda Acara)  ●  Detour Dinamis Aktif  ●  Jalur dialihkan +%.2f km (+%.0f menit)",
+                extraKm, extraMin);
+            DrawTextCustom(detourMsg, toolX + 12, bannerY + 4, 10.5f, WHITE, FONT_BOLD);
+        }
+    }
+
     // =========================================================================
     // 3. MBG Routing Optimization Card (Left Side)
     // Displays the optimized sequence, Time Windows, and algorithm metrics
     // =========================================================================
     int cardX = 16;
-    int cardY = navCardY + navCardH + 12;
-    int cardW = 420;
-    int cardH = 295;
+    int cardY = navCardY + navCardH + 10;
+    int cardW = 430;
+    int cardH = 300;
 
     DrawRectangleRounded((Rectangle){(float)cardX, (float)cardY, (float)cardW, (float)cardH}, 0.08f, 6, Fade((Color){20, 25, 35, 255}, 0.92f));
     DrawRectangleRoundedLinesEx((Rectangle){(float)cardX, (float)cardY, (float)cardW, (float)cardH}, 0.08f, 6, 1.5f, Fade(WHITE, 0.25f));
@@ -1053,14 +1556,14 @@ void PathfinderState::DrawUI() {
     DrawTextCustom(feasStr, cardX + cardW - MeasureTextCustom(feasStr, 11.5f, FONT_BOLD) - 16, cardY + 37, 11.5f, feasCol, FONT_BOLD);
 
     // Sequence header
-    DrawTextCustom("Urutan Kunjungan Optimal:", cardX + 16, cardY + 57, 11.5f, LIGHTGRAY, FONT_SEMIBOLD);
+    DrawTextCustom("Urutan Kunjungan Optimal:", cardX + 16, cardY + 56, 11.0f, LIGHTGRAY, FONT_SEMIBOLD);
 
     // SPPG Central Kitchen start badge
-    DrawRectangleRounded((Rectangle){(float)cardX + 16, (float)cardY + 76, 48, 18}, 0.3f, 4, (Color){255, 180, 0, 255});
-    DrawTextCustom("SPPG", cardX + 22, cardY + 78, 10.5f, BLACK, FONT_BOLD);
-    DrawTextCustom("Dapur Pusat MBG (Titik Awal)", cardX + 70, cardY + 78, 11.5f, (Color){255, 220, 140, 255}, FONT_REGULAR);
+    DrawRectangleRounded((Rectangle){(float)cardX + 16, (float)cardY + 74, 48, 18}, 0.3f, 4, (Color){255, 180, 0, 255});
+    DrawTextCustom("SPPG", cardX + 22, cardY + 76, 10.5f, BLACK, FONT_BOLD);
+    DrawTextCustom("Dapur Pusat MBG (Titik Awal)", cardX + 70, cardY + 76, 11.0f, (Color){255, 220, 140, 255}, FONT_REGULAR);
 
-    int rowY = cardY + 100;
+    int rowY = cardY + 96;
     for (size_t i = 0; i < m_schools.size(); i++) {
         const auto& sch = m_schools[i];
         bool isCurrent = ((int)i == m_currentLegIndex && !m_allDelivered);
@@ -1074,11 +1577,11 @@ void PathfinderState::DrawUI() {
         const char* statusStr = isDone ? "Selesai" : (isCurrent ? (m_isUnloading ? "Bongkar" : "▶ Menuju") : "Menunggu");
         Color statusColor = isDone ? (Color){100, 240, 130, 255} : (isCurrent ? YELLOW : (Color){180, 190, 205, 255});
 
-        float legMeters = (i < m_routeLegs.size()) ? (m_routeLegs[i].path.totalDistanceWorld * 4.0f) : 0.0f;
+        float legMeters = (i < m_routeLegs.size()) ? (m_routeLegs[i].path.totalDistanceWorld * 25.0f) : 0.0f;
         DrawTextCustom(TextFormat("%s • [%d-%dm] • %.0fm • %s", sch.name.c_str(), sch.window.start, sch.window.end, legMeters, statusStr),
-                       cardX + 46, rowY + 2, 11.5f, statusColor, FONT_REGULAR);
+                       cardX + 46, rowY + 2, 11.0f, statusColor, FONT_REGULAR);
 
-        rowY += 21;
+        rowY += 20;
     }
 
     // Final Step (Kembali ke SPPG)
@@ -1087,21 +1590,23 @@ void PathfinderState::DrawUI() {
     Color returnStatusCol = m_allDelivered ? (Color){100, 240, 130, 255} : (isReturnLegCurrent ? (Color){255, 220, 120, 255} : (Color){180, 190, 205, 255});
 
     float returnMeters = (!m_routeLegs.empty() && m_routeLegs.back().isReturnToDepot) ?
-                         (m_routeLegs.back().path.totalDistanceWorld * 4.0f) : 0.0f;
+                         (m_routeLegs.back().path.totalDistanceWorld * 25.0f) : 0.0f;
 
     DrawRectangleRounded((Rectangle){(float)cardX + 16, (float)rowY, 24, 18}, 0.3f, 4, (Color){255, 180, 0, 255});
     DrawTextCustom("0", cardX + 24, rowY + 2, 11, BLACK, FONT_BOLD);
     DrawTextCustom(TextFormat("Kembali ke SPPG (Titik Awal) • %.0fm • %s", returnMeters, returnStatusStr),
-                   cardX + 46, rowY + 2, 11.5f, returnStatusCol, FONT_REGULAR);
+                   cardX + 46, rowY + 2, 11.0f, returnStatusCol, FONT_REGULAR);
 
     // Performance & Metrics summary
-    DrawLine(cardX + 16, cardY + cardH - 58, cardX + cardW - 16, cardY + cardH - 58, Fade(WHITE, 0.15f));
+    DrawLine(cardX + 16, cardY + cardH - 56, cardX + cardW - 16, cardY + cardH - 56, Fade(WHITE, 0.15f));
 
-    DrawTextCustom(TextFormat("Total Cost: %d menit • Total Jarak: %.1f m", m_totalCostMinutes, m_totalRouteDistance * 4.0f),
-                   cardX + 16, cardY + cardH - 46, 11.5f, WHITE, FONT_SEMIBOLD);
+    DrawTextCustom(TextFormat("Total Cost: %d menit • Jarak Total: %.2f km (%.0f m)",
+                              m_totalCostMinutes, (m_totalRouteDistance * 25.0f) / 1000.0f, m_totalRouteDistance * 25.0f),
+                   cardX + 16, cardY + cardH - 44, 11.0f, WHITE, FONT_SEMIBOLD);
 
-    DrawTextCustom(TextFormat("States Explored: %d • Runtime: %.1f µs", m_statesExplored, m_optimizationTimeUs),
-                   cardX + 16, cardY + cardH - 26, 11.5f, (Color){140, 230, 255, 255}, FONT_REGULAR);
+    DrawTextCustom(TextFormat("States Explored: %d • Runtime: %.1f µs • Detour: %s",
+                              m_statesExplored, m_optimizationTimeUs, m_obstaclesEnabled ? "Aktif" : "Off"),
+                   cardX + 16, cardY + cardH - 24, 10.5f, (Color){140, 230, 255, 255}, FONT_REGULAR);
 
     // =========================================================================
     // 4. Real-Time 2D Minimap & Fullscreen Map Overlay
@@ -1184,6 +1689,22 @@ void PathfinderState::DrawMinimap(int screenW, int screenH) {
                    (Vector2){0, 0}, 0.0f, WHITE);
 
     // Draw each colored route leg on the minimap
+    // First, draw original blocked path (Jalur Semestinya) in striped red if detour active
+    if (m_obstaclesEnabled && m_showOriginalRoute) {
+        for (const auto& leg : m_routeLegs) {
+            if (!leg.hasDetour || leg.originalPath.gridPath.size() < 2) continue;
+            for (size_t i = 1; i < leg.originalPath.gridPath.size(); i++) {
+                float x1 = mmX + (leg.originalPath.gridPath[i-1].x / (float)m_world.GetGridWidth()) * mmW;
+                float y1 = mmY + (leg.originalPath.gridPath[i-1].y / (float)m_world.GetGridHeight()) * mmH;
+                float x2 = mmX + (leg.originalPath.gridPath[i].x / (float)m_world.GetGridWidth()) * mmW;
+                float y2 = mmY + (leg.originalPath.gridPath[i].y / (float)m_world.GetGridHeight()) * mmH;
+                // Alternating hazard stripe: red and yellow
+                Color stripeCol = ((i / 2) % 2 == 0) ? (Color){230, 40, 40, 200} : (Color){255, 220, 50, 200};
+                DrawLineEx({x1, y1}, {x2, y2}, 3.5f, stripeCol);
+            }
+        }
+    }
+
     for (const auto& leg : m_routeLegs) {
         if (!leg.path.found || leg.path.gridPath.size() < 2) continue;
 
@@ -1195,13 +1716,37 @@ void PathfinderState::DrawMinimap(int screenW, int screenH) {
             float y2 = mmY + (leg.path.gridPath[i].y / (float)m_world.GetGridHeight()) * mmH;
             DrawLineEx((Vector2){x1, y1}, (Vector2){x2, y2}, 4.0f, WHITE);
         }
-        // Leg colored line
+        // Leg colored line (Congested segments drawn in RED!)
         for (size_t i = 1; i < leg.path.gridPath.size(); i++) {
             float x1 = mmX + (leg.path.gridPath[i - 1].x / (float)m_world.GetGridWidth()) * mmW;
             float y1 = mmY + (leg.path.gridPath[i - 1].y / (float)m_world.GetGridHeight()) * mmH;
             float x2 = mmX + (leg.path.gridPath[i].x / (float)m_world.GetGridWidth()) * mmW;
             float y2 = mmY + (leg.path.gridPath[i].y / (float)m_world.GetGridHeight()) * mmH;
-            DrawLineEx((Vector2){x1, y1}, (Vector2){x2, y2}, 2.6f, leg.color);
+
+            bool isTraffic = m_trafficEnabled && (i - 1 < leg.path.waypointInTraffic.size() && leg.path.waypointInTraffic[i - 1]);
+            Color segCol = isTraffic ? (Color){235, 40, 40, 255} : leg.color;
+            DrawLineEx((Vector2){x1, y1}, (Vector2){x2, y2}, isTraffic ? 3.4f : 2.6f, segCol);
+        }
+
+        // Draw detour branch point marker on minimap
+        if (m_obstaclesEnabled && leg.hasDetour) {
+            float bx = mmX + (leg.detourBranchGrid.x / (float)m_world.GetGridWidth()) * mmW;
+            float by = mmY + (leg.detourBranchGrid.y / (float)m_world.GetGridHeight()) * mmH;
+            DrawCircle((int)bx, (int)by, 5, (Color){40, 225, 90, 255});
+            DrawCircle((int)bx, (int)by, 2, WHITE);
+        }
+    }
+
+    // Draw Obstacles (Tenda / Perbaikan Jalan) on minimap
+    if (m_obstaclesEnabled) {
+        for (const auto& obs : m_obstacles) {
+            float ox = mmX + (obs.gridPos.x / (float)m_world.GetGridWidth()) * mmW;
+            float oy = mmY + (obs.gridPos.y / (float)m_world.GetGridHeight()) * mmH;
+            // Pulsing red X marker
+            float r = 7.0f + 2.0f * sinf(m_pulseTimer * 5.0f);
+            DrawCircle((int)ox, (int)oy, (int)r, Fade((Color){220, 30, 30, 255}, 0.6f));
+            DrawCircle((int)ox, (int)oy, 4, (Color){220, 30, 30, 255});
+            DrawCircle((int)ox, (int)oy, 2, WHITE);
         }
     }
 
@@ -1369,21 +1914,80 @@ void PathfinderState::DrawFullscreenMap(int screenW, int screenH) {
     float underWidth = std::clamp(6.0f * sqrtf(m_mapZoom), 5.0f, 14.0f);
     float coreWidth  = std::clamp(3.5f * sqrtf(m_mapZoom), 3.0f, 9.0f);
 
+    // Draw Traffic Zones (translucent red heat circles)
+    if (m_trafficEnabled) {
+        for (const auto& tz : m_trafficZones) {
+            Vector2 sPos = g2s(tz.centerGrid);
+            float screenR = (tz.radiusGrid / (float)m_world.GetGridWidth()) * curW;
+            DrawCircle((int)sPos.x, (int)sPos.y, screenR, (Color){230, 40, 40, 40});
+            DrawCircleLines((int)sPos.x, (int)sPos.y, screenR, (Color){230, 50, 50, 140});
+        }
+    }
+
+    // Draw original blocked routes (Jalur Semestinya) with hazard stripe if detour is active
+    if (m_obstaclesEnabled && m_showOriginalRoute) {
+        for (const auto& leg : m_routeLegs) {
+            if (!leg.hasDetour || leg.originalPath.gridPath.size() < 2) continue;
+            for (size_t i = 1; i < leg.originalPath.gridPath.size(); i++) {
+                Vector2 p1 = g2s(leg.originalPath.gridPath[i - 1]);
+                Vector2 p2 = g2s(leg.originalPath.gridPath[i]);
+                Color stripeCol = ((i / 2) % 2 == 0) ? (Color){230, 40, 40, 200} : (Color){255, 220, 50, 200};
+                DrawLineEx(p1, p2, coreWidth * 0.85f, stripeCol);
+            }
+        }
+    }
+
     for (const auto& leg : m_routeLegs) {
         if (!leg.path.found || leg.path.gridPath.size() < 2) continue;
 
-        // White underlay border
+        // Underlay border (White normally, dark red in traffic)
         for (size_t i = 1; i < leg.path.gridPath.size(); i++) {
             Vector2 p1 = g2s(leg.path.gridPath[i - 1]);
             Vector2 p2 = g2s(leg.path.gridPath[i]);
-            DrawLineEx(p1, p2, underWidth, WHITE);
+            bool inTraffic = (i < leg.path.waypointInTraffic.size()) ? leg.path.waypointInTraffic[i] : false;
+            Color underCol = inTraffic ? (Color){160, 20, 20, 255} : WHITE;
+            DrawLineEx(p1, p2, underWidth, underCol);
         }
 
-        // Core colored leg ribbon
+        // Core colored leg ribbon (or bright Red if in traffic)
         for (size_t i = 1; i < leg.path.gridPath.size(); i++) {
             Vector2 p1 = g2s(leg.path.gridPath[i - 1]);
             Vector2 p2 = g2s(leg.path.gridPath[i]);
-            DrawLineEx(p1, p2, coreWidth, leg.color);
+            bool inTraffic = (i < leg.path.waypointInTraffic.size()) ? leg.path.waypointInTraffic[i] : false;
+            Color segColor = inTraffic ? (Color){235, 40, 40, 255} : leg.color;
+            float segW = inTraffic ? coreWidth * 1.35f : coreWidth;
+            DrawLineEx(p1, p2, segW, segColor);
+        }
+
+        // Draw detour branch marker on fullscreen map
+        if (m_obstaclesEnabled && leg.hasDetour) {
+            Vector2 bPt = g2s(leg.detourBranchGrid);
+            DrawCircle((int)bPt.x, (int)bPt.y, 12 + 3 * sinf(m_pulseTimer * 5.0f), Fade((Color){40, 225, 90, 255}, 0.45f));
+            DrawCircle((int)bPt.x, (int)bPt.y, 7, (Color){40, 225, 90, 255});
+            DrawCircle((int)bPt.x, (int)bPt.y, 3, WHITE);
+            const char* detourLabel = TextFormat("Detour +%.2fkm", leg.extraDetourKm);
+            float dlW = MeasureTextCustom(detourLabel, 9.5f, FONT_SEMIBOLD) + 12;
+            DrawRectangleRounded({bPt.x - dlW * 0.5f, bPt.y - 28, dlW, 18}, 0.3f, 4, Fade(BLACK, 0.88f));
+            DrawRectangleRoundedLinesEx({bPt.x - dlW * 0.5f, bPt.y - 28, dlW, 18}, 0.3f, 4, 1.2f, (Color){40, 225, 90, 255});
+            DrawTextCustom(detourLabel, bPt.x - dlW * 0.5f + 6, bPt.y - 25, 9.5f, (Color){180, 255, 200, 255}, FONT_SEMIBOLD);
+        }
+    }
+
+    // Draw Obstacles (Tenda Acara Warga / Penutupan Jalan)
+    if (m_obstaclesEnabled) {
+        for (const auto& obs : m_obstacles) {
+            Vector2 oPos = g2s(obs.gridPos);
+            // Pulsing warning ring
+            DrawCircle((int)oPos.x, (int)oPos.y, 14 + 4 * sinf(m_pulseTimer * 5.0f), Fade(RED, 0.35f));
+            DrawCircle((int)oPos.x, (int)oPos.y, 10, (Color){220, 30, 30, 255});
+            DrawCircle((int)oPos.x, (int)oPos.y, 6, WHITE);
+
+            // Floating pill label
+            const char* obsLabel = "⛔ Tenda Acara (Tutup)";
+            float obW = MeasureTextCustom(obsLabel, 10, FONT_BOLD) + 14;
+            DrawRectangleRounded((Rectangle){oPos.x - obW * 0.5f, oPos.y - 30, obW, 19}, 0.3f, 4, Fade(BLACK, 0.88f));
+            DrawRectangleRoundedLinesEx((Rectangle){oPos.x - obW * 0.5f, oPos.y - 30, obW, 19}, 0.3f, 4, 1.2f, (Color){255, 60, 60, 255});
+            DrawTextCustom(obsLabel, oPos.x - obW * 0.5f + 7, oPos.y - 27, 10, (Color){255, 120, 120, 255}, FONT_BOLD);
         }
     }
 
@@ -1467,9 +2071,10 @@ void PathfinderState::DrawFullscreenMap(int screenW, int screenH) {
     DrawTextCustom("Kembali SPPG", legX + 5, barY + 8, 9.5f, BLACK, FONT_BOLD);
 
     // Right summary metrics
-    const char* sumStr = TextFormat("Total: %.1f m • Cost: %d mnt • %s",
-                                    m_totalRouteDistance * 4.0f,
-                                    m_totalCostMinutes,
+    const char* sumStr = TextFormat("Jarak: %.2f km • ETA: %d mnt (Macet +%d mnt) • %s",
+                                    m_totalRouteDistance * 0.045f,
+                                    m_realisticEtaMinutes,
+                                    m_trafficDelayMinutes,
                                     m_routeFeasible ? "Layak (Feasible)" : "Overdue");
     float sumW = MeasureTextCustom(sumStr, 11, FONT_SEMIBOLD);
     DrawTextCustom(sumStr, viewX + viewW - sumW - 16, barY + 8, 11, (Color){140, 230, 255, 255}, FONT_SEMIBOLD);
