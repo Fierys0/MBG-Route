@@ -79,7 +79,7 @@ void PathfinderState::LoadFonts() {
     std::vector<int> codepoints;
     for (int i = 32; i < 127; i++) codepoints.push_back(i); // ASCII 32-126
     for (int i = 160; i < 256; i++) codepoints.push_back(i); // Latin-1
-    codepoints.push_back(0x2022); // • (Bullet)
+    codepoints.push_back(0x2022); // | (Bullet)
     codepoints.push_back(0x2190); // ← (Left)
     codepoints.push_back(0x2191); // ↑ (Up)
     codepoints.push_back(0x2192); // → (Right)
@@ -183,11 +183,26 @@ void PathfinderState::Init() {
 
     // 0. Load Montserrat Typography from assets/fonts
     LoadFonts();
+    OSMService::Instance().Init();
+    m_depotName = OSMService::Instance().GetDepotName();
 
-    // 1. Generate 3D procedural world using Ray Casting against map image
-    bool ok = m_world.GenerateFromImage("assets/map.jpg", 6);
-    if (!ok) {
-        TraceLog(LOG_ERROR, "Failed to generate world from assets/map.jpg");
+    // 1. Generate 3D procedural world from authentic OpenStreetMap road vectors
+    const char* osmMapFile = "assets/osm_pondok_labu_hd.png";
+    const char* osmBinFile = "assets/osm_roads_pondok_labu.bin";
+    bool worldLoaded = false;
+
+    if (FileExists(osmMapFile) && FileExists(osmBinFile)) {
+        worldLoaded = m_world.GenerateFromOSM(osmMapFile, osmBinFile, 4);
+        if (worldLoaded) {
+            m_osmMapLoaded = true;
+            TraceLog(LOG_INFO, "[OSM] 3D world successfully generated from real OpenStreetMap road vectors!");
+        }
+    }
+
+    if (!worldLoaded) {
+        TraceLog(LOG_INFO, "Fallback: Generating 3D world from assets/map.jpg...");
+        m_world.GenerateFromImage("assets/map.jpg", 6);
+        m_osmMapLoaded = false;
     }
 
     // 2. Load 3D GLTF models
@@ -220,6 +235,11 @@ void PathfinderState::Init() {
 void PathfinderState::Cleanup() {
     UnloadRouteModels();
     UnloadFonts();
+
+    if (m_osmMapLoaded && m_osmMapTexture.id > 0) {
+        UnloadTexture(m_osmMapTexture);
+        m_osmMapLoaded = false;
+    }
 
     if (m_truckLoaded) {
         UnloadModel(m_truckModel);
@@ -413,56 +433,134 @@ void PathfinderState::GenerateObstaclesAndTraffic() {
 // Pick multiple school destinations on the connected road network
 // and initialize SPPG (Dapur Pusat) and schools with Time Windows
 // =============================================================================
-void PathfinderState::RandomizePositions() {
-    // 1. Pick SPPG (Satuan Pelayanan Pemenuhan Gizi / Central Kitchen) location
-    m_carStartGridPos = m_world.GetRandomRoadPosition();
-    m_carCurrentPos = m_world.GridToWorld(m_carStartGridPos.x, m_carStartGridPos.y, 0.05f);
+void PathfinderState::SwitchMapMode(bool useOSM) {
+    if (useOSM == m_world.IsGeneratedFromOSM()) {
+        return;
+    }
 
+    bool success = false;
+    if (useOSM) {
+        const char* osmMapFile = "assets/osm_pondok_labu_hd.png";
+        const char* osmBinFile = "assets/osm_roads_pondok_labu.bin";
+        if (FileExists(osmMapFile) && FileExists(osmBinFile)) {
+            success = m_world.GenerateFromOSM(osmMapFile, osmBinFile, 4);
+            if (success) {
+                m_osmMapLoaded = true;
+                if (!OSMService::Instance().IsOSMViewEnabled()) {
+                    OSMService::Instance().ToggleOSMView();
+                }
+            }
+        }
+    } else {
+        success = m_world.GenerateFromImage("assets/map.jpg", 6);
+        if (success) {
+            m_osmMapLoaded = false;
+            if (OSMService::Instance().IsOSMViewEnabled()) {
+                OSMService::Instance().ToggleOSMView();
+            }
+        }
+    }
+
+    if (success) {
+        RandomizePositions();
+        TraceLog(LOG_INFO, "Switched map mode: %s", useOSM ? "OpenStreetMap (Real Roads)" : "Offline JPG");
+    }
+}
+
+void PathfinderState::RandomizePositions() {
     // Clamp school count to [3, MAX_SCHOOLS]
     if (m_numSchools < 3) m_numSchools = 3;
     if (m_numSchools > MAX_SCHOOLS) m_numSchools = MAX_SCHOOLS;
 
-    // 2. Pick distinct schools on connected roads with good spatial distribution
-    std::vector<Vector2> pickedSchoolGridCoords;
-    int attempts = 0;
+    // Check if authentic OSM landmarks are available in this world
+    const auto& osmLms = m_world.GetOSMLandmarks();
+    bool useOsmLms = (m_world.IsGeneratedFromOSM() && osmLms.size() >= 4);
 
-    while ((int)pickedSchoolGridCoords.size() < m_numSchools && attempts < 400) {
-        attempts++;
-        Vector2 cand = m_world.GetRandomRoadPosition();
+    if (useOsmLms) {
+        // Depot is authentic Central Kitchen near UPNVJ Campus
+        m_depotName = osmLms[0].name;
+        m_carStartGridPos = osmLms[0].gridPos;
+        m_carCurrentPos = m_world.GridToWorld(m_carStartGridPos.x, m_carStartGridPos.y, 0.05f);
 
-        if (!m_world.AreConnected(m_carStartGridPos, cand)) continue;
-        if (Vector2Distance(m_carStartGridPos, cand) < 28.0f) continue;
+        // Pick distinct authentic schools from OSM landmarks pool
+        std::vector<int> availableIndices;
+        for (int i = 1; i < (int)osmLms.size(); i++) {
+            availableIndices.push_back(i);
+        }
+        // Shuffle to offer variety when user presses [R] (Acak Lokasi)
+        for (size_t i = availableIndices.size() - 1; i > 0; i--) {
+            size_t j = (size_t)GetRandomValue(0, (int)i);
+            std::swap(availableIndices[i], availableIndices[j]);
+        }
 
-        bool tooCloseToOther = false;
-        for (const auto& existing : pickedSchoolGridCoords) {
-            if (Vector2Distance(existing, cand) < 26.0f) {
-                tooCloseToOther = true;
-                break;
+        m_schools.clear();
+        for (int i = 0; i < m_numSchools && i < (int)availableIndices.size(); i++) {
+            int lmIdx = availableIndices[i];
+            Vector2 gPos = osmLms[lmIdx].gridPos;
+
+            SchoolDestination sch;
+            sch.id = i + 1;
+            sch.name = osmLms[lmIdx].name;
+            sch.streetName = m_world.GetStreetNameAt((int)gPos.x, (int)gPos.y);
+            sch.gridPos = gPos;
+            sch.worldPos = m_world.GridToWorld(gPos.x, gPos.y, 0.0f);
+
+            float estDist = Vector2Distance(m_carStartGridPos, gPos);
+            int baseMins = std::max(15, (int)(estDist * 0.45f));
+            sch.window.start = std::max(10, baseMins - 10);
+            sch.window.end   = baseMins + 75 + i * 25;
+            sch.unloadTime   = 5;
+            sch.color        = LEG_COLORS[i % 6];
+            sch.darkColor    = LEG_DARK_COLORS[i % 6];
+            sch.reached      = false;
+            m_schools.push_back(sch);
+        }
+    } else {
+        // 1. Pick SPPG location
+        m_carStartGridPos = m_world.GetRandomRoadPosition();
+        m_carCurrentPos = m_world.GridToWorld(m_carStartGridPos.x, m_carStartGridPos.y, 0.05f);
+        m_depotName = OSMService::Instance().GetDepotName();
+
+        // 2. Pick distinct schools on connected roads
+        std::vector<Vector2> pickedSchoolGridCoords;
+        int attempts = 0;
+
+        while ((int)pickedSchoolGridCoords.size() < m_numSchools && attempts < 400) {
+            attempts++;
+            Vector2 cand = m_world.GetRandomRoadPosition();
+
+            if (!m_world.AreConnected(m_carStartGridPos, cand)) continue;
+            if (Vector2Distance(m_carStartGridPos, cand) < 28.0f) continue;
+
+            bool tooCloseToOther = false;
+            for (const auto& existing : pickedSchoolGridCoords) {
+                if (Vector2Distance(existing, cand) < 26.0f) {
+                    tooCloseToOther = true;
+                    break;
+                }
+            }
+            if (!tooCloseToOther) {
+                pickedSchoolGridCoords.push_back(cand);
             }
         }
-        if (!tooCloseToOther) {
-            pickedSchoolGridCoords.push_back(cand);
+
+        while ((int)pickedSchoolGridCoords.size() < m_numSchools) {
+            Vector2 cand = m_world.GetRandomRoadPosition();
+            if (m_world.AreConnected(m_carStartGridPos, cand)) {
+                pickedSchoolGridCoords.push_back(cand);
+            }
         }
-    }
 
-    // Fallback if strict spacing didn't find enough
-    while ((int)pickedSchoolGridCoords.size() < m_numSchools) {
-        Vector2 cand = m_world.GetRandomRoadPosition();
-        if (m_world.AreConnected(m_carStartGridPos, cand)) {
-            pickedSchoolGridCoords.push_back(cand);
-        }
-    }
+        m_schools.clear();
+        for (int i = 0; i < (int)pickedSchoolGridCoords.size(); i++) {
+            Vector2 gPos = pickedSchoolGridCoords[i];
 
-    // 3. Assemble schools with realistic delivery Time Windows and unload times
-    m_schools.clear();
-    for (int i = 0; i < (int)pickedSchoolGridCoords.size(); i++) {
-        Vector2 gPos = pickedSchoolGridCoords[i];
-
-        SchoolDestination sch;
-        sch.id = i + 1;
-        sch.name = TextFormat("SDN 0%d", i + 1);
-        sch.gridPos = gPos;
-        sch.worldPos = m_world.GridToWorld(gPos.x, gPos.y, 0.0f);
+            SchoolDestination sch;
+            sch.id = i + 1;
+            sch.name = OSMService::Instance().GetSchoolName(i);
+            sch.streetName = OSMService::Instance().ResolveStreetName(gPos, m_world.GetGridWidth(), m_world.GetGridHeight());
+            sch.gridPos = gPos;
+            sch.worldPos = m_world.GridToWorld(gPos.x, gPos.y, 0.0f);
 
         // Realistic delivery time windows in minutes:
         // Lunch delivery window between 10:00 - 12:30 (simulated in minutes)
@@ -476,6 +574,7 @@ void PathfinderState::RandomizePositions() {
         sch.reached      = false;
 
         m_schools.push_back(sch);
+    }
     }
 
     // 4. Generate Road Obstacles (Tenda) & Traffic Congestion Zones
@@ -622,7 +721,7 @@ void PathfinderState::OptimizeAndBuildRoutes() {
         m_schools[i].color = LEG_COLORS[i % 6];
         m_schools[i].darkColor = LEG_DARK_COLORS[i % 6];
         m_schools[i].reached = false;
-        m_optimizationLog += TextFormat(" → [%d] %s (%s)", (int)i + 1, m_schools[i].name.c_str(), LEG_COLOR_NAMES[i % 6]);
+    m_optimizationLog += TextFormat(" -> [%d] %s (%s)", (int)i + 1, m_schools[i].name.c_str(), LEG_COLOR_NAMES[i]);
     }
 
     // Build the routes and 3D colored ribbon meshes for each leg
@@ -639,6 +738,9 @@ void PathfinderState::OptimizeAndBuildRoutes() {
 
         Vector2 startPos = (prevId == 0) ? m_carStartGridPos : m_schools[i - 1].gridPos;
         Vector2 goalPos = m_schools[i].gridPos;
+        std::string startName = (prevId == 0) ? m_depotName : m_schools[i - 1].name;
+        std::string goalName = m_schools[i].name;
+        leg.osmNav = OSMService::Instance().QueryRoute(startPos, goalPos, m_world.GetGridWidth(), m_world.GetGridHeight(), startName, goalName);
 
         // Retrieve road path from cache or compute
         std::pair<int, int> key1 = {prevId, curId};
@@ -735,12 +837,13 @@ void PathfinderState::OptimizeAndBuildRoutes() {
         RouteLeg returnLeg;
         returnLeg.legIndex = (int)m_schools.size();
         returnLeg.targetSchoolIndex = -1;
-        returnLeg.destinationName = "SPPG (Dapur Pusat)";
+        returnLeg.destinationName = m_depotName;
         returnLeg.color = (Color){255, 185, 0, 255}; // Vibrant Amber/Gold matching SPPG
         returnLeg.isReturnToDepot = true;
 
         Vector2 startPos = m_schools.back().gridPos;
         Vector2 goalPos = m_carStartGridPos;
+        returnLeg.osmNav = OSMService::Instance().QueryRoute(startPos, goalPos, m_world.GetGridWidth(), m_world.GetGridHeight(), m_schools.back().name, m_depotName);
 
         std::pair<int, int> key1 = {lastSchoolId, 0};
         std::pair<int, int> key2 = {0, lastSchoolId};
@@ -794,7 +897,7 @@ void PathfinderState::OptimizeAndBuildRoutes() {
         }
 
         m_routeLegs.push_back(returnLeg);
-        m_optimizationLog += " → [Akhir] SPPG (Kembali ke Titik Awal)";
+    m_optimizationLog += " -> [Akhir] SPPG (Kembali ke Titik Awal)";
     }
 
     // Preserve car driving progress on current leg if car was already moving
@@ -841,11 +944,12 @@ void PathfinderState::UpdateNavigationStatus() {
     }
 
     // Distance remaining on current leg and traffic congestion distance
-    int curIdx = (int)m_legDriveProgress;
+    int numWp = (int)curLeg.path.worldWaypoints.size();
+    int curIdx = std::clamp((int)m_legDriveProgress, 0, numWp - 1);
     float distLeg = 0.0f;
     float trafficDistLeg = 0.0f;
 
-    if (curIdx < (int)curLeg.path.worldWaypoints.size()) {
+    if (curIdx < numWp) {
         float d0 = Vector3Distance(m_carCurrentPos, curLeg.path.worldWaypoints[curIdx]);
         distLeg += d0;
         if (curIdx < (int)curLeg.path.waypointInTraffic.size() && curLeg.path.waypointInTraffic[curIdx]) {
@@ -880,7 +984,15 @@ void PathfinderState::UpdateNavigationStatus() {
     }
     m_totalDistanceRemaining = totalRem;
 
-    // Detect turn instruction along upcoming waypoints
+    // OpenStreetMap Real Turn-by-Turn Guidance & Street Resolver
+    Vector2 carGrid = m_world.WorldToGrid(m_carCurrentPos);
+    OSMService::Instance().UpdateNavigationGuidance(
+        carGrid, m_currentLegIndex, m_legDriveProgress,
+        curLeg.path.gridPath, curLeg.path.worldWaypoints,
+        curLeg.isReturnToDepot, curLeg.destinationName,
+        m_turnInstruction, m_currentStreetName, m_turnIcon, m_distToNextManeuverMeters
+    );
+    return;
     int lookAhead = curIdx + 1;
     if (lookAhead + 1 < (int)curLeg.path.worldWaypoints.size()) {
         Vector3 v1 = Vector3Subtract(curLeg.path.worldWaypoints[lookAhead], curLeg.path.worldWaypoints[curIdx]);
@@ -910,6 +1022,8 @@ void PathfinderState::UpdateCarDriving(float dt) {
         return;
     }
 
+    dt = std::clamp(dt, 0.0f, 0.05f);
+
     // Advance realistic simulation clock (1 real second = 15 sim seconds * multiplier)
     m_simClockSeconds += (double)(dt * 15.0f * m_simSpeedMultiplier);
 
@@ -930,11 +1044,13 @@ void PathfinderState::UpdateCarDriving(float dt) {
         m_speedStatusStr = nearTurn ? "Menikung (24 km/j)" : "Lancar (48 km/j)";
     }
 
-    // Smooth speed interpolation (acceleration / deceleration)
-    m_carCurrentSpeedKmh = Lerp(m_carCurrentSpeedKmh, m_carTargetSpeedKmh, 3.5f * dt);
+    // Smooth speed interpolation (acceleration / deceleration) with clamped alpha
+    float speedLerpFactor = std::clamp(3.5f * dt, 0.0f, 1.0f);
+    m_carCurrentSpeedKmh = Lerp(m_carCurrentSpeedKmh, m_carTargetSpeedKmh, speedLerpFactor);
+    m_carCurrentSpeedKmh = std::clamp(m_carCurrentSpeedKmh, 0.0f, 120.0f);
 
     // Dynamic movement speed scaled by km/h and simulation speed multiplier
-    m_driveSpeed = (m_carCurrentSpeedKmh / 45.0f) * 10.5f * m_simSpeedMultiplier;
+    m_driveSpeed = std::max(0.0f, (m_carCurrentSpeedKmh / 45.0f) * 10.5f * m_simSpeedMultiplier);
 
     // Handle unloading simulation at school
     if (m_isUnloading) {
@@ -961,13 +1077,15 @@ void PathfinderState::UpdateCarDriving(float dt) {
     }
 
     const auto& curLeg = m_routeLegs[m_currentLegIndex];
-    if (!curLeg.path.found || curLeg.path.worldWaypoints.size() < 2) return;
+    int numWp = (int)curLeg.path.worldWaypoints.size();
+    if (!curLeg.path.found || numWp < 2) return;
 
-    int curIdx = (int)m_legDriveProgress;
+    m_legDriveProgress = std::max(0.0f, m_legDriveProgress);
+    int curIdx = std::clamp((int)m_legDriveProgress, 0, numWp - 1);
     int nextIdx = curIdx + 1;
 
     // Check if car reached current destination
-    if (nextIdx >= (int)curLeg.path.worldWaypoints.size()) {
+    if (nextIdx >= numWp) {
         m_carCurrentPos = curLeg.path.worldWaypoints.back();
 
         if (curLeg.isReturnToDepot) {
@@ -1001,13 +1119,13 @@ void PathfinderState::UpdateCarDriving(float dt) {
     if (segDist < 0.001f) segDist = 0.001f;
 
     float step = (m_driveSpeed * dt) / segDist;
-    m_legDriveProgress += step;
+    m_legDriveProgress = std::max(0.0f, m_legDriveProgress + step);
 
-    curIdx = (int)m_legDriveProgress;
+    curIdx = std::clamp((int)m_legDriveProgress, 0, numWp - 1);
     nextIdx = curIdx + 1;
 
-    if (nextIdx < (int)curLeg.path.worldWaypoints.size()) {
-        float frac = m_legDriveProgress - curIdx;
+    if (curIdx >= 0 && nextIdx < numWp) {
+        float frac = std::clamp(m_legDriveProgress - (float)curIdx, 0.0f, 1.0f);
         pA = curLeg.path.worldWaypoints[curIdx];
         pB = curLeg.path.worldWaypoints[nextIdx];
         m_carCurrentPos = Vector3Lerp(pA, pB, frac);
@@ -1050,6 +1168,7 @@ void PathfinderState::UpdateCameraControls() {
 
 void PathfinderState::Update() {
     float dt = GetFrameTime();
+    if (dt > 0.05f) dt = 0.05f; // Protect against lag spike on initialization / window moving
     m_pulseTimer += dt;
 
     // Hotkeys
@@ -1078,10 +1197,17 @@ void PathfinderState::Update() {
             m_mapPan = {0, 0};
         }
     }
-    if (IsKeyPressed(KEY_ESCAPE) && m_mapFullscreen) {
-        m_mapFullscreen = false;
-        m_mapZoom = 1.0f;
-        m_mapPan = {0, 0};
+    if (IsKeyPressed(KEY_N)) m_showItinerarySheet = !m_showItinerarySheet;
+    if (IsKeyPressed(KEY_P)) m_showLocationModal = !m_showLocationModal;
+    if (IsKeyPressed(KEY_V)) SwitchMapMode(!m_world.IsGeneratedFromOSM());
+    if (IsKeyPressed(KEY_ESCAPE)) {
+        if (m_showItinerarySheet) m_showItinerarySheet = false;
+        else if (m_showLocationModal) m_showLocationModal = false;
+        else if (m_mapFullscreen) {
+            m_mapFullscreen = false;
+            m_mapZoom = 1.0f;
+            m_mapPan = {0, 0};
+        }
     }
     if (IsKeyPressed(KEY_H)) m_showMinimap = !m_showMinimap;
     if (IsKeyPressed(KEY_O)) {
@@ -1236,7 +1362,7 @@ void PathfinderState::DrawDirty() {
                 Vector3 roadFwd = {sinf(rad), 0, cosf(rad)};
                 Vector3 roadPerp = {-cosf(rad), 0, sinf(rad)};
 
-                // 1. Draw 3D International "No Entry / Road Closed" ⛔ decal on the asphalt road surface
+    // 1. Draw 3D International "No Entry / Road Closed" [X] decal on the asphalt road surface
                 DrawCircle3D(Vector3Add(obs.worldPos, (Vector3){0, 0.05f, 0}), 1.6f, (Vector3){1, 0, 0}, 90.0f, Fade((Color){230, 35, 35, 255}, 0.75f));
                 DrawCube(Vector3Add(obs.worldPos, (Vector3){0, 0.06f, 0}), 1.3f, 0.02f, 0.32f, WHITE);
 
@@ -1314,7 +1440,7 @@ void PathfinderState::DrawUI() {
     int navCardX = 16;
     int navCardY = 14;
     int navCardW = 430;
-    int navCardH = m_allDelivered ? 100 : 138;
+    int navCardH = m_allDelivered ? 100 : 158;
 
     bool isReturningToDepot = (!m_routeLegs.empty() && m_currentLegIndex < (int)m_routeLegs.size() && m_routeLegs[m_currentLegIndex].isReturnToDepot);
 
@@ -1338,7 +1464,10 @@ void PathfinderState::DrawUI() {
     int arrM = (arrSecs % 3600) / 60;
 
     // Top status strip: Clock & Speedometer Badge
-    DrawTextCustom(TextFormat("🕒 %02d:%02d:%02d WIB", curH, curM, curS), navCardX + 18, navCardY + 12, 12.0f, (Color){255, 250, 220, 255}, FONT_BOLD);
+    DrawTextCustom(TextFormat("JAM: %02d:%02d:%02d WIB", curH, curM, curS), navCardX + 18, navCardY + 12, 12.0f, (Color){255, 250, 220, 255}, FONT_BOLD);
+    std::string osmBadge = OSMService::Instance().GetStatusString();
+    Color osmBadgeCol = OSMService::Instance().IsOnline() ? (Color){180, 255, 200, 255} : (Color){255, 220, 160, 255};
+    DrawTextCustom(osmBadge.c_str(), navCardX + 155, navCardY + 13, 10.5f, osmBadgeCol, FONT_SEMIBOLD);
 
     // Speedometer badge
     int speedVal = (int)roundf(m_carCurrentSpeedKmh);
@@ -1346,7 +1475,7 @@ void PathfinderState::DrawUI() {
                          (m_isCarInTraffic ? (Color){220, 35, 35, 255} :
                          ((m_speedStatusStr.find("Menikung") != std::string::npos) ? (Color){200, 160, 20, 255} : (Color){34, 180, 80, 255}));
     const char* speedStatusShort = m_isUnloading ? "BONGKAR" : (m_isCarInTraffic ? "MACET" : ((m_speedStatusStr.find("Menikung") != std::string::npos) ? "TIKUNGAN" : "LANCAR"));
-    const char* speedText = TextFormat("%d KM/J • %s", speedVal, speedStatusShort);
+    const char* speedText = TextFormat("%d KM/J | %s", speedVal, speedStatusShort);
     float spdW = MeasureTextCustom(speedText, 10.5f, FONT_BOLD) + 16;
     DrawRectangleRounded((Rectangle){navCardX + navCardW - spdW - 14, (float)navCardY + 9, spdW, 20}, 0.35f, 4, speedBadgeBg);
     DrawTextCustom(speedText, navCardX + navCardW - spdW - 6, navCardY + 13, 10.5f, WHITE, FONT_BOLD);
@@ -1358,27 +1487,28 @@ void PathfinderState::DrawUI() {
         DrawTextCustom(TextFormat("Seluruh %d sekolah terlayani & mobil kembali ke SPPG tepat waktu!", (int)m_schools.size()),
                        navCardX + 20, navCardY + 68, 11.5f, (Color){220, 255, 230, 255}, FONT_REGULAR);
     } else if (isReturningToDepot) {
-        const char* retIcon = (m_turnInstruction.find("Kanan") != std::string::npos) ? "→" :
-                              ((m_turnInstruction.find("Kiri") != std::string::npos) ? "←" : "↑");
+        const char* retIcon = (m_turnInstruction.find("Kanan") != std::string::npos) ? "->" :
+                              ((m_turnInstruction.find("Kiri") != std::string::npos) ? "<-" : "^");
         DrawTextCustom(retIcon, navCardX + 20, navCardY + 44, 26, WHITE, FONT_BOLD);
         DrawTextCustom(m_turnInstruction.c_str(), navCardX + 58, navCardY + 42, 16.5f, WHITE, FONT_BOLD);
-        DrawTextCustom("Langkah Akhir: Kembali ke Titik Awal (SPPG)", navCardX + 58, navCardY + 63, 11.5f, WHITE, FONT_SEMIBOLD);
+        DrawTextCustom(TextFormat("Sedang di: %s", m_currentStreetName.c_str()), navCardX + 58, navCardY + 63, 11.5f, (Color){255, 245, 170, 255}, FONT_SEMIBOLD);
+        DrawTextCustom(TextFormat("Langkah Akhir: Kembali ke %s", m_depotName.c_str()), navCardX + 58, navCardY + 81, 11.0f, WHITE, FONT_REGULAR);
 
         float metersCurrent = m_distanceToCurrentTarget * 25.0f;
         float kmCurrent = metersCurrent / 1000.0f;
-        DrawTextCustom(TextFormat("Jarak: %.2f km (%.0f m) • ETA: %.0f Menit (Tiba ~%02d:%02d WIB)",
+        DrawTextCustom(TextFormat("Jarak: %.2f km (%.0f m) | ETA: %.0f Menit (Tiba ~%02d:%02d WIB)",
                                   kmCurrent, metersCurrent, m_realisticEtaMinutes, arrH, arrM),
-                       navCardX + 58, navCardY + 82, 11.5f, (Color){255, 255, 180, 255}, FONT_REGULAR);
+                       navCardX + 58, navCardY + 99, 11.5f, (Color){255, 255, 180, 255}, FONT_REGULAR);
 
         if (m_isCarInTraffic) {
-            DrawTextCustom("🔴 Zona Macet: Kecepatan mobil turun ke 12 km/jam", navCardX + 58, navCardY + 102, 11.0f, (Color){255, 130, 130, 255}, FONT_BOLD);
+            DrawTextCustom("[!] Zona Macet: Kecepatan mobil turun ke 12 km/jam", navCardX + 58, navCardY + 119, 11.0f, (Color){255, 130, 130, 255}, FONT_BOLD);
         } else {
-            DrawTextCustom("🟢 Menuju pangkalan dapur pusat SPPG", navCardX + 58, navCardY + 102, 11.0f, (Color){230, 255, 220, 255}, FONT_REGULAR);
+            DrawTextCustom("[OK] Menuju pangkalan dapur pusat SPPG", navCardX + 58, navCardY + 119, 11.0f, (Color){230, 255, 220, 255}, FONT_REGULAR);
         }
     } else {
-        const char* iconStr = m_isUnloading ? "▶" :
-                              ((m_turnInstruction.find("Kanan") != std::string::npos) ? "→" :
-                              ((m_turnInstruction.find("Kiri") != std::string::npos) ? "←" : "↑"));
+        const char* iconStr = m_isUnloading ? ">" :
+                              ((m_turnInstruction.find("Kanan") != std::string::npos) ? "->" :
+                              ((m_turnInstruction.find("Kiri") != std::string::npos) ? "<-" : "^"));
         DrawTextCustom(iconStr, navCardX + 20, navCardY + 44, 26, WHITE, FONT_BOLD);
         DrawTextCustom(m_turnInstruction.c_str(), navCardX + 58, navCardY + 42, 16.5f, WHITE, FONT_BOLD);
 
@@ -1386,22 +1516,23 @@ void PathfinderState::DrawUI() {
         const char* colName = (m_currentLegIndex < 6) ? LEG_COLOR_NAMES[m_currentLegIndex] : "Warna";
         const char* schName = (m_currentLegIndex < (int)m_schools.size()) ? m_schools[m_currentLegIndex].name.c_str() : "Sekolah";
 
-        DrawTextCustom(TextFormat("Tujuan: %s (Stop %d dari %d • Jalur %s)", schName, targetId, (int)m_schools.size(), colName),
-                       navCardX + 58, navCardY + 63, 11.5f, WHITE, FONT_SEMIBOLD);
+        DrawTextCustom(TextFormat("Sedang di: %s", m_currentStreetName.c_str()), navCardX + 58, navCardY + 63, 11.5f, (Color){255, 245, 170, 255}, FONT_SEMIBOLD);
+        DrawTextCustom(TextFormat("Tujuan: %s (Stop %d dari %d | Jalur %s)", schName, targetId, (int)m_schools.size(), colName),
+                       navCardX + 58, navCardY + 81, 11.0f, WHITE, FONT_REGULAR);
 
         float metersCurrent = m_distanceToCurrentTarget * 25.0f;
         float kmCurrent = metersCurrent / 1000.0f;
-        DrawTextCustom(TextFormat("Jarak: %.2f km (%.0f m) • ETA: %.0f Menit (Tiba ~%02d:%02d WIB)",
+        DrawTextCustom(TextFormat("Jarak: %.2f km (%.0f m) | ETA: %.0f Menit (Tiba ~%02d:%02d WIB)",
                                   kmCurrent, metersCurrent, m_realisticEtaMinutes, arrH, arrM),
-                       navCardX + 58, navCardY + 82, 11.5f, (Color){255, 255, 180, 255}, FONT_REGULAR);
+                       navCardX + 58, navCardY + 99, 11.5f, (Color){255, 255, 180, 255}, FONT_REGULAR);
 
         if (m_isCarInTraffic) {
-            DrawTextCustom(TextFormat("🔴 Zona Macet (+%.0f mnt delay) • Kecepatan 12 km/jam", m_trafficDelayMinutes),
-                           navCardX + 58, navCardY + 102, 11.0f, (Color){255, 140, 140, 255}, FONT_BOLD);
+            DrawTextCustom(TextFormat("[!] Zona Macet (+%.0f mnt delay) - Kecepatan 12 km/jam", m_trafficDelayMinutes),
+                           navCardX + 58, navCardY + 119, 11.0f, (Color){255, 140, 140, 255}, FONT_BOLD);
         } else if (m_currentLegIndex < (int)m_schools.size()) {
             const auto& w = m_schools[m_currentLegIndex].window;
-            DrawTextCustom(TextFormat("Window Pengantaran: [%d - %d mnt] • Bongkar: 5m", w.start, w.end),
-                           navCardX + 58, navCardY + 102, 11.0f, (Color){230, 245, 255, 255}, FONT_REGULAR);
+            DrawTextCustom(TextFormat("Window Pengantaran: [%d - %d mnt] | Bongkar: 5m", w.start, w.end),
+                           navCardX + 58, navCardY + 119, 11.0f, (Color){230, 245, 255, 255}, FONT_REGULAR);
         }
     }
 
@@ -1412,28 +1543,27 @@ void PathfinderState::DrawUI() {
     int toolY = 14;
 
     bool isModified = (m_routingAlgorithm == ROUTING_DP_MODIFIED);
-    StateButton btnMod      = {{(float)toolX, (float)toolY, 136, 36}, "DP Modified [TAB]", isModified};
-    StateButton btnBaseAlgo = {{(float)toolX + 142, (float)toolY, 116, 36}, "DP Baseline", !isModified};
-    StateButton btnRandomize= {{(float)toolX + 264, (float)toolY, 106, 36}, "Acak Rute [R]", false};
-    StateButton btnDrive    = {{(float)toolX + 376, (float)toolY, 104, 36}, m_isDriving ? "Jeda [SPACE]" : "Auto Jalan", m_isDriving};
-    StateButton btnMap      = {{(float)toolX + 486, (float)toolY, 126, 36}, m_mapFullscreen ? "Tutup Peta [M]" : "Peta Penuh [M]", m_mapFullscreen};
+    StateButton btnMod       = {{(float)toolX,        (float)toolY, 125, 36}, "DP Modified [TAB]", isModified};
+    StateButton btnBaseAlgo  = {{(float)toolX + 130,  (float)toolY, 105, 36}, "DP Baseline",       !isModified};
+    StateButton btnRandomize = {{(float)toolX + 240,  (float)toolY, 105, 36}, "Acak Rute [R]",     false};
+    StateButton btnDrive     = {{(float)toolX + 350,  (float)toolY, 105, 36}, m_isDriving ? "Jeda [SPACE]" : "Auto Jalan", m_isDriving};
+    StateButton btnItinerary = {{(float)toolX + 460,  (float)toolY, 105, 36}, "Rute OSM [N]",     m_showItinerarySheet};
+    StateButton btnLocation  = {{(float)toolX + 570,  (float)toolY,  90, 36}, "Lokasi [P]",        m_showLocationModal};
+    StateButton btnMap       = {{(float)toolX + 665,  (float)toolY,  85, 36}, m_mapFullscreen ? "Tutup [M]" : "Peta [M]", m_mapFullscreen};
 
     // Row 2 of controls (Obstacles, Traffic, Simulation Speed, School Count, Camera)
     int row2Y = toolY + 42;
-    StateButton btnObstacle = {{(float)toolX, (float)row2Y, 136, 32},
-                              m_obstaclesEnabled ? "Hambatan: ON [O]" : "Hambatan: OFF [O]", m_obstaclesEnabled};
-    StateButton btnTraffic  = {{(float)toolX + 142, (float)row2Y, 116, 32},
-                              m_trafficEnabled ? "Macet: ON [T]" : "Macet: OFF [T]", m_trafficEnabled};
-    StateButton btnSimSpeed = {{(float)toolX + 264, (float)row2Y, 106, 32},
-                              TextFormat("Speed: %.0fx [X]", m_simSpeedMultiplier), m_simSpeedMultiplier > 1.0f};
-    StateButton btnOrigRoute = {{(float)toolX + 376, (float)row2Y, 124, 32},
-                               m_showOriginalRoute ? "Jalur Asli: ON [B]" : "Jalur Asli: OFF [B]", m_showOriginalRoute};
+    StateButton btnObstacle  = {{(float)toolX,        (float)row2Y, 125, 32}, m_obstaclesEnabled ? "Hambatan: ON [O]" : "Hambatan: OFF [O]", m_obstaclesEnabled};
+    StateButton btnTraffic   = {{(float)toolX + 130,  (float)row2Y, 105, 32}, m_trafficEnabled ? "Macet: ON [T]" : "Macet: OFF [T]", m_trafficEnabled};
+    StateButton btnSimSpeed  = {{(float)toolX + 240,  (float)row2Y, 105, 32}, TextFormat("Speed: %.0fx [X]", m_simSpeedMultiplier), m_simSpeedMultiplier > 1.0f};
+    StateButton btnOrigRoute = {{(float)toolX + 350,  (float)row2Y, 105, 32}, m_showOriginalRoute ? "Jalur Asli [B]" : "Jalur Asli: OFF", m_showOriginalRoute};
+    StateButton btnOSMView   = {{(float)toolX + 460,  (float)row2Y, 105, 32}, m_world.IsGeneratedFromOSM() ? "Peta: OSM [V]" : "Peta: JPG [V]", m_world.IsGeneratedFromOSM()};
 
-    StateButton btnMinusSchool = {{(float)toolX + 506, (float)row2Y, 28, 32}, "[-]", false};
-    StateButton btnSchoolCount = {{(float)toolX + 538, (float)row2Y, 70, 32}, TextFormat("%d Sek", m_numSchools), true};
-    StateButton btnPlusSchool  = {{(float)toolX + 612, (float)row2Y, 28, 32}, "[+]", false};
+    StateButton btnMinusSchool = {{(float)toolX + 570, (float)row2Y, 26, 32}, "[-]", false};
+    StateButton btnSchoolCount = {{(float)toolX + 600, (float)row2Y, 60, 32}, TextFormat("%d Sek", m_numSchools), true};
+    StateButton btnPlusSchool  = {{(float)toolX + 664, (float)row2Y, 26, 32}, "[+]", false};
 
-    StateButton btnCam = {{(float)toolX + 646, (float)row2Y, 74, 32},
+    StateButton btnCam = {{(float)toolX + 694, (float)row2Y, 70, 32},
                           (m_camMode == APP_CAM_FOLLOW_CAR) ? "Truk [C]" : "Sek [S]",
                           m_camMode == APP_CAM_FOLLOW_CAR};
 
@@ -1444,12 +1574,15 @@ void PathfinderState::DrawUI() {
     btnBaseAlgo.Draw(m_fontSemiBold, btnBase, btnHover, LEG_COLORS[2], !isModified ? WHITE : BLACK);
     btnRandomize.Draw(m_fontSemiBold, btnBase, btnHover, LEG_COLORS[1], BLACK);
     btnDrive.Draw(m_fontSemiBold, btnBase, btnHover, {230, 60, 60, 255}, m_isDriving ? WHITE : BLACK);
+    btnItinerary.Draw(m_fontSemiBold, btnBase, btnHover, (Color){50, 160, 230, 255}, m_showItinerarySheet ? WHITE : BLACK);
+    btnLocation.Draw(m_fontSemiBold, btnBase, btnHover, (Color){150, 90, 240, 255}, m_showLocationModal ? WHITE : BLACK);
     btnMap.Draw(m_fontSemiBold, btnBase, btnHover, (Color){30, 144, 255, 255}, m_mapFullscreen ? WHITE : BLACK);
 
     btnObstacle.Draw(m_fontSemiBold, btnBase, btnHover, (Color){240, 140, 20, 255}, m_obstaclesEnabled ? WHITE : BLACK);
     btnTraffic.Draw(m_fontSemiBold, btnBase, btnHover, (Color){230, 50, 50, 255}, m_trafficEnabled ? WHITE : BLACK);
     btnSimSpeed.Draw(m_fontSemiBold, btnBase, btnHover, (Color){40, 180, 80, 255}, m_simSpeedMultiplier > 1.0f ? WHITE : BLACK);
     btnOrigRoute.Draw(m_fontSemiBold, btnBase, btnHover, (Color){70, 180, 255, 255}, m_showOriginalRoute ? WHITE : BLACK);
+    btnOSMView.Draw(m_fontSemiBold, btnBase, btnHover, (Color){0, 180, 140, 255}, m_world.IsGeneratedFromOSM() ? WHITE : BLACK);
 
     btnMinusSchool.Draw(m_fontBold, btnBase, btnHover, {200, 200, 210, 255}, BLACK);
     btnSchoolCount.Draw(m_fontSemiBold, btnBase, btnHover, Fade(LEG_COLORS[1], 0.85f), WHITE);
@@ -1470,6 +1603,12 @@ void PathfinderState::DrawUI() {
     }
     if (btnDrive.IsClicked()) {
         m_isDriving = !m_isDriving;
+    }
+    if (btnItinerary.IsClicked()) {
+        m_showItinerarySheet = !m_showItinerarySheet;
+    }
+    if (btnLocation.IsClicked()) {
+        m_showLocationModal = !m_showLocationModal;
     }
     if (btnMap.IsClicked()) {
         m_mapFullscreen = !m_mapFullscreen;
@@ -1493,6 +1632,9 @@ void PathfinderState::DrawUI() {
     }
     if (btnOrigRoute.IsClicked()) {
         m_showOriginalRoute = !m_showOriginalRoute;
+    }
+    if (btnOSMView.IsClicked()) {
+        SwitchMapMode(!m_world.IsGeneratedFromOSM());
     }
     if (btnMinusSchool.IsClicked() && m_numSchools > 3) {
         m_numSchools--;
@@ -1525,7 +1667,7 @@ void PathfinderState::DrawUI() {
                 (Rectangle){(float)toolX, (float)bannerY, 620, 22}, 0.25f, 4,
                 Fade((Color){255, 60, 30, 255}, pulse * 0.92f));
             const char* detourMsg = TextFormat(
-                "⛔  JALAN DIBLOKADE (Tenda Acara)  ●  Detour Dinamis Aktif  ●  Jalur dialihkan +%.2f km (+%.0f menit)",
+                "[!] JALAN DIBLOKADE (Tenda Acara) | Detour Dinamis Aktif | Jalur dialihkan +%.2f km (+%.0f menit delay)",
                 extraKm, extraMin);
             DrawTextCustom(detourMsg, toolX + 12, bannerY + 4, 10.5f, WHITE, FONT_BOLD);
         }
@@ -1574,11 +1716,11 @@ void PathfinderState::DrawUI() {
         DrawTextCustom(TextFormat("%d", (int)i + 1), cardX + 24, rowY + 2, 11, WHITE, FONT_BOLD);
 
         // Status string
-        const char* statusStr = isDone ? "Selesai" : (isCurrent ? (m_isUnloading ? "Bongkar" : "▶ Menuju") : "Menunggu");
+        const char* statusStr = isDone ? "Selesai" : (isCurrent ? (m_isUnloading ? "Bongkar" : "> Menuju") : "Menunggu");
         Color statusColor = isDone ? (Color){100, 240, 130, 255} : (isCurrent ? YELLOW : (Color){180, 190, 205, 255});
 
         float legMeters = (i < m_routeLegs.size()) ? (m_routeLegs[i].path.totalDistanceWorld * 25.0f) : 0.0f;
-        DrawTextCustom(TextFormat("%s • [%d-%dm] • %.0fm • %s", sch.name.c_str(), sch.window.start, sch.window.end, legMeters, statusStr),
+        DrawTextCustom(TextFormat("%s | [%d-%dm] | %.0fm | %s", sch.name.c_str(), sch.window.start, sch.window.end, legMeters, statusStr),
                        cardX + 46, rowY + 2, 11.0f, statusColor, FONT_REGULAR);
 
         rowY += 20;
@@ -1586,7 +1728,7 @@ void PathfinderState::DrawUI() {
 
     // Final Step (Kembali ke SPPG)
     bool isReturnLegCurrent = isReturningToDepot && !m_allDelivered;
-    const char* returnStatusStr = m_allDelivered ? "Tiba di SPPG" : (isReturnLegCurrent ? "▶ Sedang Kembali" : "Menunggu");
+    const char* returnStatusStr = m_allDelivered ? "Tiba di SPPG" : (isReturnLegCurrent ? "> Sedang Kembali" : "Menunggu");
     Color returnStatusCol = m_allDelivered ? (Color){100, 240, 130, 255} : (isReturnLegCurrent ? (Color){255, 220, 120, 255} : (Color){180, 190, 205, 255});
 
     float returnMeters = (!m_routeLegs.empty() && m_routeLegs.back().isReturnToDepot) ?
@@ -1594,17 +1736,17 @@ void PathfinderState::DrawUI() {
 
     DrawRectangleRounded((Rectangle){(float)cardX + 16, (float)rowY, 24, 18}, 0.3f, 4, (Color){255, 180, 0, 255});
     DrawTextCustom("0", cardX + 24, rowY + 2, 11, BLACK, FONT_BOLD);
-    DrawTextCustom(TextFormat("Kembali ke SPPG (Titik Awal) • %.0fm • %s", returnMeters, returnStatusStr),
+    DrawTextCustom(TextFormat("Kembali ke SPPG (Titik Awal) | %.0fm | %s", returnMeters, returnStatusStr),
                    cardX + 46, rowY + 2, 11.0f, returnStatusCol, FONT_REGULAR);
 
     // Performance & Metrics summary
     DrawLine(cardX + 16, cardY + cardH - 56, cardX + cardW - 16, cardY + cardH - 56, Fade(WHITE, 0.15f));
 
-    DrawTextCustom(TextFormat("Total Cost: %d menit • Jarak Total: %.2f km (%.0f m)",
+    DrawTextCustom(TextFormat("Total Cost: %d menit | Jarak Total: %.2f km (%.0f m)",
                               m_totalCostMinutes, (m_totalRouteDistance * 25.0f) / 1000.0f, m_totalRouteDistance * 25.0f),
                    cardX + 16, cardY + cardH - 44, 11.0f, WHITE, FONT_SEMIBOLD);
 
-    DrawTextCustom(TextFormat("States Explored: %d • Runtime: %.1f µs • Detour: %s",
+    DrawTextCustom(TextFormat("States Explored: %d - Runtime: %.1f us - Detour: %s",
                               m_statesExplored, m_optimizationTimeUs, m_obstaclesEnabled ? "Aktif" : "Off"),
                    cardX + 16, cardY + cardH - 24, 10.5f, (Color){140, 230, 255, 255}, FONT_REGULAR);
 
@@ -1619,14 +1761,22 @@ void PathfinderState::DrawUI() {
         DrawFullscreenMap(screenW, screenH);
     }
 
+    if (m_showItinerarySheet) {
+        DrawItinerarySheet(screenW, screenH);
+    }
+
+    if (m_showLocationModal) {
+        DrawLocationModal(screenW, screenH);
+    }
+
     // Top Right FPS & Engine info
     Fumbo::Instance().DrawFPS(screenW - 105, 16);
 }
 
 void PathfinderState::DrawMinimap(int screenW, int screenH) {
-    if (m_world.GetMapTexture().id == 0) return;
-
     Texture2D mapTex = m_world.GetMapTexture();
+    bool useOSM = m_world.IsGeneratedFromOSM();
+    if (mapTex.id == 0) return;
     float mmW = m_minimapWidth;
     float aspect = (float)m_world.GetGridHeight() / (float)m_world.GetGridWidth();
     float mmH = mmW * aspect;
@@ -1652,7 +1802,7 @@ void PathfinderState::DrawMinimap(int screenW, int screenH) {
     DrawRectangleRoundedLinesEx((Rectangle){mmX - 4.0f, mmY - 28.0f, mmW + 8.0f, mmH + 34.0f}, 0.04f, 4, 1.5f, Fade(WHITE, 0.35f));
 
     // Header label
-    DrawTextCustom("Peta MBG (Scroll: Resize)", mmX + 6.0f, mmY - 22.0f, 11.5f, WHITE, FONT_SEMIBOLD);
+    DrawTextCustom(useOSM ? "Peta OpenStreetMap (Scroll: Zoom)" : "Peta MBG (Scroll: Zoom)", mmX + 6.0f, mmY - 22.0f, 11.5f, WHITE, FONT_SEMIBOLD);
 
     // Header control buttons: [-], [+], and [Fullscreen / Full]
     Rectangle btnMinusRect = {mmX + mmW - 80.0f, mmY - 25.0f, 22.0f, 18.0f};
@@ -1779,9 +1929,9 @@ void PathfinderState::DrawMinimap(int screenW, int screenH) {
 }
 
 void PathfinderState::DrawFullscreenMap(int screenW, int screenH) {
-    if (m_world.GetMapTexture().id == 0) return;
-
     Texture2D mapTex = m_world.GetMapTexture();
+    bool useOSM = m_world.IsGeneratedFromOSM();
+    if (mapTex.id == 0) return;
 
     // 1. Dark semi-transparent backdrop over entire screen
     DrawRectangle(0, 0, screenW, screenH, Fade(BLACK, 0.88f));
@@ -1802,8 +1952,9 @@ void PathfinderState::DrawFullscreenMap(int screenW, int screenH) {
     DrawRectangle((float)modalX + 2, (float)modalY + 2, (float)modalW - 4, 48, (Color){28, 35, 50, 255});
     DrawLine(modalX + 16, modalY + 50, modalX + modalW - 16, modalY + 50, Fade(WHITE, 0.2f));
 
-    DrawTextCustom("PETA DISTRIBUSI RUTE MBG (RESOLUSI PENUH)", modalX + 18, modalY + 11, 15, WHITE, FONT_BOLD);
-    DrawTextCustom(TextFormat("Resolusi Asli: %dx%d • Zoom: %.1fx • Scroll: Zoom • Drag: Geser Peta",
+        const char* fsMainTitle = useOSM ? "PETA DIGITAL OPENSTREETMAP (PONDOK LABU)" : "PETA DISTRIBUSI RUTE MBG (RESOLUSI PENUH)";
+    DrawTextCustom(fsMainTitle, modalX + 18, modalY + 11, 15, WHITE, FONT_BOLD);
+    DrawTextCustom(TextFormat("Resolusi Asli: %dx%d | Zoom: %.1fx | Scroll: Zoom | Drag: Geser Peta",
                               mapTex.width, mapTex.height, m_mapZoom),
                    modalX + 18, modalY + 31, 11, (Color){160, 205, 250, 255}, FONT_REGULAR);
 
@@ -1983,7 +2134,7 @@ void PathfinderState::DrawFullscreenMap(int screenW, int screenH) {
             DrawCircle((int)oPos.x, (int)oPos.y, 6, WHITE);
 
             // Floating pill label
-            const char* obsLabel = "⛔ Tenda Acara (Tutup)";
+    const char* obsLabel = "[!] Tenda Acara (Tutup)";
             float obW = MeasureTextCustom(obsLabel, 10, FONT_BOLD) + 14;
             DrawRectangleRounded((Rectangle){oPos.x - obW * 0.5f, oPos.y - 30, obW, 19}, 0.3f, 4, Fade(BLACK, 0.88f));
             DrawRectangleRoundedLinesEx((Rectangle){oPos.x - obW * 0.5f, oPos.y - 30, obW, 19}, 0.3f, 4, 1.2f, (Color){255, 60, 60, 255});
@@ -2053,7 +2204,7 @@ void PathfinderState::DrawFullscreenMap(int screenW, int screenH) {
     legX += 50;
 
     for (size_t i = 0; i < m_schools.size(); i++) {
-        DrawTextCustom("→", legX, barY + 7, 12, WHITE, FONT_BOLD);
+        DrawTextCustom("->", legX, barY + 7, 12, WHITE, FONT_BOLD);
         legX += 16;
 
         const auto& sch = m_schools[i];
@@ -2065,17 +2216,241 @@ void PathfinderState::DrawFullscreenMap(int screenW, int screenH) {
         legX += MeasureTextCustom(sch.name.c_str(), 11, FONT_REGULAR) + 12;
     }
 
-    DrawTextCustom("→", legX, barY + 7, 12, WHITE, FONT_BOLD);
+        DrawTextCustom("->", legX, barY + 7, 12, WHITE, FONT_BOLD);
     legX += 16;
     DrawRectangleRounded((Rectangle){(float)legX, (float)barY + 6, 80, 18}, 0.3f, 4, (Color){255, 180, 0, 255});
     DrawTextCustom("Kembali SPPG", legX + 5, barY + 8, 9.5f, BLACK, FONT_BOLD);
 
     // Right summary metrics
-    const char* sumStr = TextFormat("Jarak: %.2f km • ETA: %d mnt (Macet +%d mnt) • %s",
+    const char* sumStr = TextFormat("Jarak: %.2f km | ETA: %d mnt (Macet +%d mnt) | %s",
                                     m_totalRouteDistance * 0.045f,
                                     m_realisticEtaMinutes,
                                     m_trafficDelayMinutes,
                                     m_routeFeasible ? "Layak (Feasible)" : "Overdue");
     float sumW = MeasureTextCustom(sumStr, 11, FONT_SEMIBOLD);
     DrawTextCustom(sumStr, viewX + viewW - sumW - 16, barY + 8, 11, (Color){140, 230, 255, 255}, FONT_SEMIBOLD);
+}
+
+void PathfinderState::DrawItinerarySheet(int screenW, int screenH) {
+    // Backdrop
+    DrawRectangle(0, 0, screenW, screenH, Fade(BLACK, 0.65f));
+
+    // Center dialog card
+    int sheetW = 660;
+    int sheetH = std::min(screenH - 80, 680);
+    int sheetX = (screenW - sheetW) / 2;
+    int sheetY = (screenH - sheetH) / 2;
+
+    Vector2 mouse = GetMousePosition();
+
+    // Modal background
+    DrawRectangleRounded((Rectangle){(float)sheetX, (float)sheetY, (float)sheetW, (float)sheetH}, 0.03f, 6, (Color){22, 28, 42, 252});
+    DrawRectangleRoundedLinesEx((Rectangle){(float)sheetX, (float)sheetY, (float)sheetW, (float)sheetH}, 0.03f, 6, 1.5f, Fade(WHITE, 0.35f));
+
+    // Header
+    DrawRectangleRounded((Rectangle){(float)sheetX, (float)sheetY, (float)sheetW, 58}, 0.03f, 6, (Color){15, 20, 32, 255});
+    DrawTextCustom("Petunjuk Rute & Turn-by-Turn OpenStreetMap", sheetX + 20, sheetY + 12, 15.0f, WHITE, FONT_BOLD);
+
+    const auto& loc = OSMService::Instance().GetCurrentLocation();
+    std::string subHead = TextFormat("Wilayah: %s - %s", loc.name.c_str(), OSMService::Instance().GetStatusString().c_str());
+    DrawTextCustom(subHead.c_str(), sheetX + 20, sheetY + 34, 11.0f, (Color){160, 210, 255, 255}, FONT_REGULAR);
+
+    // Close button [X]
+    Rectangle closeBtnRect = {(float)sheetX + sheetW - 90, (float)sheetY + 14, 76, 28};
+    bool hoverClose = CheckCollisionPointRec(mouse, closeBtnRect);
+    DrawRectangleRounded(closeBtnRect, 0.25f, 4, hoverClose ? (Color){220, 50, 50, 255} : (Color){70, 80, 100, 255});
+    DrawTextCustom("Tutup [N]", closeBtnRect.x + 10, closeBtnRect.y + 7, 11.0f, WHITE, FONT_BOLD);
+    if (hoverClose && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
+        m_showItinerarySheet = false;
+        return;
+    }
+
+    // Scrollable content area
+    int contentX = sheetX + 16;
+    int contentY = sheetY + 68;
+    int contentW = sheetW - 32;
+    int contentH = sheetH - 120;
+
+    // Handle mouse wheel scrolling
+    static float s_scrollOffset = 0.0f;
+    if (CheckCollisionPointRec(mouse, (Rectangle){(float)sheetX, (float)contentY, (float)sheetW, (float)contentH})) {
+        float wheel = GetMouseWheelMove();
+        if (wheel != 0.0f) {
+            s_scrollOffset -= wheel * 35.0f;
+        }
+    }
+
+    BeginScissorMode(contentX, contentY, contentW, contentH);
+
+    float curY = (float)contentY - s_scrollOffset;
+    float totalContentHeight = 0.0f;
+
+    if (m_routeLegs.empty()) {
+        DrawTextCustom("Belum ada rute aktif. Tekan [Acak Rute] untuk menghasilkan rute baru.", contentX + 20, curY + 20, 12.0f, LIGHTGRAY, FONT_REGULAR);
+        totalContentHeight += 60.0f;
+    } else {
+        for (size_t l = 0; l < m_routeLegs.size(); l++) {
+            const auto& leg = m_routeLegs[l];
+
+            // Leg header
+            std::string legTitle = leg.isReturnToDepot ?
+                TextFormat("Leg %d: %s -> %s (Kembali)", (int)l + 1, leg.osmNav.originName.c_str(), leg.osmNav.destinationName.c_str()) :
+                TextFormat("Leg %d: %s -> %s", (int)l + 1, leg.osmNav.originName.c_str(), leg.osmNav.destinationName.c_str());
+
+            Color legBg = Fade(leg.color, 0.22f);
+            DrawRectangleRounded((Rectangle){(float)contentX, curY, (float)contentW, 30}, 0.2f, 4, legBg);
+            DrawRectangleRoundedLinesEx((Rectangle){(float)contentX, curY, (float)contentW, 30}, 0.2f, 4, 1.0f, Fade(leg.color, 0.6f));
+
+            // Small color strip
+            DrawRectangleRounded((Rectangle){(float)contentX + 6, curY + 6, 10, 18}, 0.3f, 2, leg.color);
+            DrawTextCustom(legTitle.c_str(), contentX + 24, curY + 7, 12.0f, WHITE, FONT_BOLD);
+
+            std::string legMetrics = TextFormat("%.2f km - %.0f mnt", leg.osmNav.totalDistanceKm, leg.osmNav.estimatedMinutes);
+            float metW = MeasureTextCustom(legMetrics.c_str(), 11.0f, FONT_SEMIBOLD);
+            DrawTextCustom(legMetrics.c_str(), contentX + contentW - metW - 12, curY + 8, 11.0f, (Color){255, 240, 150, 255}, FONT_SEMIBOLD);
+
+            curY += 36;
+            totalContentHeight += 36;
+
+            if (leg.osmNav.steps.empty()) {
+                DrawTextCustom("  - Lurus mengikuti koridor jalan", contentX + 24, curY, 11.0f, GRAY, FONT_REGULAR);
+                curY += 22;
+                totalContentHeight += 22;
+            } else {
+                for (size_t s = 0; s < leg.osmNav.steps.size(); s++) {
+                    const auto& step = leg.osmNav.steps[s];
+
+                    // Step icon badge
+                    DrawRectangleRounded((Rectangle){(float)contentX + 16, curY, 32, 20}, 0.25f, 2, (Color){40, 52, 75, 255});
+                    DrawTextCustom(step.icon.c_str(), contentX + 19, curY + 3, 10.5f, (Color){100, 210, 255, 255}, FONT_BOLD);
+
+                    // Step instruction
+                    DrawTextCustom(step.instruction.c_str(), contentX + 54, curY + 3, 11.5f, WHITE, FONT_REGULAR);
+
+                    // Step distance
+                    std::string distStr = TextFormat("%.0f m", step.distanceMeters);
+                    float dW = MeasureTextCustom(distStr.c_str(), 10.5f, FONT_REGULAR);
+                    DrawTextCustom(distStr.c_str(), contentX + contentW - dW - 14, curY + 3, 10.5f, (Color){200, 215, 235, 255}, FONT_REGULAR);
+
+                    curY += 24;
+                    totalContentHeight += 24;
+                }
+            }
+
+            curY += 10;
+            totalContentHeight += 10;
+        }
+    }
+
+    EndScissorMode();
+
+    // Clamp scroll
+    float maxScroll = std::max(0.0f, totalContentHeight - (float)contentH);
+    s_scrollOffset = std::clamp(s_scrollOffset, 0.0f, maxScroll);
+
+    // Scrollbar indicator
+    if (maxScroll > 0.0f) {
+        float barH = (float)contentH * ((float)contentH / totalContentHeight);
+        float barY = (float)contentY + (s_scrollOffset / maxScroll) * ((float)contentH - barH);
+        DrawRectangleRounded((Rectangle){(float)contentX + contentW - 4, barY, 4, barH}, 0.5f, 2, Fade(WHITE, 0.4f));
+    }
+
+    // Footer summary bar
+    int footY = sheetY + sheetH - 46;
+    DrawRectangleRounded((Rectangle){(float)sheetX, (float)footY, (float)sheetW, 46}, 0.03f, 6, (Color){15, 20, 32, 255});
+    DrawLine(sheetX, footY, sheetX + sheetW, footY, Fade(WHITE, 0.15f));
+
+    std::string footerText = TextFormat("Total: %d Leg Pengantaran - %.2f km - Ditenagai OSRM OpenStreetMap Engine",
+                                        (int)m_routeLegs.size(), (m_totalRouteDistance * 25.0f) / 1000.0f);
+    DrawTextCustom(footerText.c_str(), sheetX + 20, footY + 15, 11.0f, (Color){160, 220, 255, 255}, FONT_SEMIBOLD);
+
+    DrawTextCustom("[ESC] Tutup", sheetX + sheetW - 90, footY + 15, 11.0f, LIGHTGRAY, FONT_REGULAR);
+}
+
+void PathfinderState::DrawLocationModal(int screenW, int screenH) {
+    // Backdrop
+    DrawRectangle(0, 0, screenW, screenH, Fade(BLACK, 0.65f));
+
+    int modalW = 600;
+    int modalH = 480;
+    int modalX = (screenW - modalW) / 2;
+    int modalY = (screenH - modalH) / 2;
+
+    Vector2 mouse = GetMousePosition();
+
+    // Dialog card
+    DrawRectangleRounded((Rectangle){(float)modalX, (float)modalY, (float)modalW, (float)modalH}, 0.03f, 6, (Color){20, 26, 40, 252});
+    DrawRectangleRoundedLinesEx((Rectangle){(float)modalX, (float)modalY, (float)modalW, (float)modalH}, 0.03f, 6, 1.5f, Fade(WHITE, 0.35f));
+
+    // Header
+    DrawRectangleRounded((Rectangle){(float)modalX, (float)modalY, (float)modalW, 56}, 0.03f, 6, (Color){14, 18, 30, 255});
+    DrawTextCustom("Pilih Preset Wilayah OpenStreetMap", modalX + 20, modalY + 12, 15.0f, WHITE, FONT_BOLD);
+    DrawTextCustom("Menyesuaikan geolokasi GPS, sekolah autentik, dan data jalan OSRM",
+                   modalX + 20, modalY + 33, 11.0f, (Color){160, 210, 255, 255}, FONT_REGULAR);
+
+    // Close button [X]
+    Rectangle closeBtnRect = {(float)modalX + modalW - 90, (float)modalY + 14, 76, 28};
+    bool hoverClose = CheckCollisionPointRec(mouse, closeBtnRect);
+    DrawRectangleRounded(closeBtnRect, 0.25f, 4, hoverClose ? (Color){220, 50, 50, 255} : (Color){70, 80, 100, 255});
+    DrawTextCustom("Tutup [P]", closeBtnRect.x + 10, closeBtnRect.y + 7, 11.0f, WHITE, FONT_BOLD);
+    if (hoverClose && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
+        m_showLocationModal = false;
+        return;
+    }
+
+    int cardY = modalY + 68;
+    int presetCount = OSMService::Instance().GetPresetCount();
+    const auto& currentLoc = OSMService::Instance().GetCurrentLocation();
+
+    for (int i = 0; i < presetCount; i++) {
+        const auto& preset = OSMService::Instance().GetPreset(i);
+        bool isActive = (currentLoc.id == preset.id);
+
+        Rectangle itemRect = {(float)modalX + 16, (float)cardY, (float)modalW - 32, 74};
+        bool hoverItem = CheckCollisionPointRec(mouse, itemRect);
+
+        Color itemBg = isActive ? (Color){30, 50, 80, 255} : (hoverItem ? (Color){28, 36, 56, 255} : (Color){22, 28, 44, 255});
+        DrawRectangleRounded(itemRect, 0.12f, 4, itemBg);
+        DrawRectangleRoundedLinesEx(itemRect, 0.12f, 4, 1.0f, isActive ? (Color){60, 160, 255, 255} : Fade(WHITE, 0.2f));
+
+        // Location title
+        DrawTextCustom(preset.name.c_str(), itemRect.x + 14, itemRect.y + 10, 13.0f, WHITE, FONT_BOLD);
+        DrawTextCustom(TextFormat("Wilayah: %s - Dapur: %s", preset.district.c_str(), preset.depotName.c_str()),
+                       itemRect.x + 14, itemRect.y + 29, 10.5f, (Color){200, 215, 235, 255}, FONT_REGULAR);
+
+        // Coordinates & Schools count
+        std::string infoStr = TextFormat("GPS: %.4f, %.4f | %d Sekolah Terdaftar",
+                                         preset.centerLat, preset.centerLon, (int)preset.schoolNames.size());
+        DrawTextCustom(infoStr.c_str(), itemRect.x + 14, itemRect.y + 48, 10.0f, (Color){140, 180, 220, 255}, FONT_REGULAR);
+
+        // Action button
+        Rectangle actionBtn = {itemRect.x + itemRect.width - 105, itemRect.y + 22, 92, 30};
+        if (isActive) {
+            DrawRectangleRounded(actionBtn, 0.25f, 3, (Color){34, 160, 75, 255});
+            DrawTextCustom("[AKTIF]", actionBtn.x + 22, actionBtn.y + 8, 11.0f, WHITE, FONT_BOLD);
+        } else {
+            bool hoverBtn = CheckCollisionPointRec(mouse, actionBtn);
+            DrawRectangleRounded(actionBtn, 0.25f, 3, hoverBtn ? (Color){50, 130, 230, 255} : (Color){35, 95, 175, 255});
+            DrawTextCustom("Pilih", actionBtn.x + 30, actionBtn.y + 8, 11.0f, WHITE, FONT_SEMIBOLD);
+
+            if ((hoverItem || hoverBtn) && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
+                OSMService::Instance().SetLocationPreset(i);
+                m_depotName = OSMService::Instance().GetDepotName();
+                RandomizePositions();
+                m_showLocationModal = false;
+                return;
+            }
+        }
+
+        cardY += 84;
+    }
+
+    // Footer info
+    int footY = modalY + modalH - 46;
+    DrawRectangleRounded((Rectangle){(float)modalX, (float)footY, (float)modalW, 46}, 0.03f, 6, (Color){14, 18, 30, 255});
+    DrawLine(modalX, footY, modalX + modalW, footY, Fade(WHITE, 0.15f));
+
+    DrawTextCustom("Peta raster 3D menggunakan citra Pondok Labu (assets/map.jpg)",
+                   modalX + 20, footY + 16, 10.5f, (Color){255, 230, 150, 255}, FONT_REGULAR);
+    DrawTextCustom("[ESC] Tutup", modalX + modalW - 90, footY + 16, 11.0f, LIGHTGRAY, FONT_REGULAR);
 }

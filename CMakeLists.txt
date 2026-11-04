@@ -86,11 +86,16 @@ target_link_libraries(${PROJECT_NAME}
 )
 
 if(UNIX AND NOT APPLE)
+    find_package(CURL QUIET)
+    if(CURL_FOUND)
+        target_link_libraries(${PROJECT_NAME} PRIVATE CURL::libcurl)
+        target_compile_definitions(${PROJECT_NAME} PRIVATE HAVE_CURL=1)
+    endif()
     target_link_libraries(${PROJECT_NAME} PRIVATE m pthread dl rt X11)
 endif()
 
 if(WIN32)
-    target_link_libraries(${PROJECT_NAME} PRIVATE winmm gdi32 opengl32 shell32)
+    target_link_libraries(${PROJECT_NAME} PRIVATE winmm gdi32 opengl32 shell32 wininet)
     target_link_options(${PROJECT_NAME} PRIVATE "-Wl,--allow-multiple-definition")
 endif()
 

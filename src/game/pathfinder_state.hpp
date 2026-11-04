@@ -3,6 +3,7 @@
 #include "fumbo.hpp"
 #include "raycast_world.hpp"
 #include "pathfinder.hpp"
+#include "osm_service.hpp"
 #include "Common.h"
 #include "Graph.h"
 #include "Dijkstra.h"
@@ -27,7 +28,8 @@ enum MBGRoutingAlgorithm {
 // =============================================================================
 struct SchoolDestination {
     int id;                   // 1-based index (1, 2, 3...)
-    std::string name;         // "SDN 01", "SDN 02", etc.
+    std::string name;         // Authentic OpenStreetMap school name
+    std::string streetName;   // e.g. "Jl. Pondok Labu Raya"
     Vector2 gridPos;
     Vector3 worldPos;
     TimeWindow window;        // [start, end] in minutes (jam pengantaran makanan)
@@ -45,6 +47,7 @@ struct RouteLeg {
     int legIndex;             // 0, 1, 2...
     int targetSchoolIndex;    // index into m_schools array (-1 for return to SPPG)
     std::string destinationName; // Name of destination
+    OSMLegNavigation osmNav;  // OpenStreetMap turn-by-turn guidance and metrics
     Color color;              // Unique color for this leg (Blue, Green, Orange, etc.)
     PathResult path;
     Model pathModel;          // Core colored ribbon
@@ -119,7 +122,7 @@ private:
     bool m_routeFeasible = true;            // Kelayakan rute terhadap time window & freshness (240m)
     int m_totalCostMinutes = 0;             // Total cost rute dalam menit
     int m_statesExplored = 0;               // Jumlah states dieksplorasi (pada DP Modified)
-    double m_optimizationTimeUs = 0.0;      // Waktu eksekusi optimasi MBG (µs)
+    double m_optimizationTimeUs = 0.0;      // Waktu eksekusi optimasi MBG (us)
     std::vector<int> m_optimalSequence;     // Urutan id sekolah hasil optimasi
 
     // Core systems
@@ -189,9 +192,21 @@ private:
     AppCameraMode m_camMode = APP_CAM_FOLLOW_CAR;
     int m_camSchoolTargetIdx = 0;
 
+    // OpenStreetMap Real Navigation & Guidance State
+    std::string m_depotName = "SPPG Dapur Pusat Pondok Labu";
+    std::string m_currentStreetName = "Jl. Pondok Labu Raya";
+    std::string m_turnIcon = "^";
+    float m_distToNextManeuverMeters = 0.0f;
+    bool m_showItinerarySheet = false; // [N]
+    bool m_showLocationModal = false;  // [P]
+
     // Lidar ray casting visualization
     bool m_showLidar = true;
     std::vector<RayHitResult> m_lidarHits;
+
+    // OpenStreetMap Live Map Image Texture
+    Texture2D m_osmMapTexture = {0};
+    bool m_osmMapLoaded = false;
 
     // UI state & Map View
     bool m_showMinimap = true;
@@ -220,6 +235,7 @@ private:
     float MeasureTextCustom(const char* text, float size, FontStyle style = FONT_REGULAR) const;
 
     // Internal actions
+    void SwitchMapMode(bool useOSM);
     void RandomizePositions();
     void GenerateObstaclesAndTraffic();
     bool IsGridInTraffic(Vector2 gPos) const;
@@ -231,4 +247,6 @@ private:
     void DrawUI();
     void DrawMinimap(int screenW, int screenH);
     void DrawFullscreenMap(int screenW, int screenH);
+    void DrawItinerarySheet(int screenW, int screenH);
+    void DrawLocationModal(int screenW, int screenH);
 };

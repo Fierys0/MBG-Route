@@ -3,6 +3,7 @@
 #include "raylib.h"
 #include "raymath.h"
 #include <vector>
+#include <string>
 #include <cmath>
 #include <cstdint>
 
@@ -24,13 +25,24 @@ struct RayHitResult {
     MapTileType tileType;
 };
 
+// Represents an authentic landmark in OpenStreetMap (e.g. Depot, School)
+struct OSMLandmark {
+    std::string name;
+    uint8_t type = 0; // 0 = Central Kitchen (Depot), 1 = School
+    Vector2 normPos = {0, 0}; // Normalized [0.0, 1.0] across map canvas
+    Vector2 gridPos = {0, 0}; // Snapped to nearest connected road grid coordinate
+};
+
 // Procedural 3D City generated via Ray Casting against the map image
 class RaycastWorld {
 public:
     RaycastWorld();
     ~RaycastWorld();
 
-    // Generate 3D world by casting rays against map image
+    // Generate 3D procedural world using authentic OpenStreetMap vector road data
+    bool GenerateFromOSM(const char* imagePath, const char* osmBinPath, int downscaleFactor = 4);
+
+    // Generate 3D world by casting rays against map image (fallback)
     bool GenerateFromImage(const char* imagePath, int downscaleFactor = 6);
     void Cleanup();
 
@@ -56,6 +68,11 @@ public:
     Vector2 GetRandomRoadPosition() const;
     bool AreConnected(Vector2 a, Vector2 b) const;
 
+    // OpenStreetMap metadata & street lookup
+    bool IsGeneratedFromOSM() const { return m_isFromOSM; }
+    const std::vector<OSMLandmark>& GetOSMLandmarks() const { return m_osmLandmarks; }
+    std::string GetStreetNameAt(int gx, int gy) const;
+
     // Dimensions
     int GetGridWidth() const { return m_gridWidth; }
     int GetGridHeight() const { return m_gridHeight; }
@@ -66,6 +83,10 @@ private:
     int m_gridWidth = 0;
     int m_gridHeight = 0;
     float m_cellWorldSize = 0.5f;
+
+    bool m_isFromOSM = false;
+    std::vector<OSMLandmark> m_osmLandmarks;
+    std::vector<std::string> m_gridStreetNames;
 
     std::vector<MapTileType> m_grid;
     std::vector<float> m_heights;          // 3D heights for buildings

@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cstring>
 #include <cmath>
+#include <fstream>
 
 static const float GROUND_Y = 0.0f;
 static const float SHADOW_Y = 0.01f; // Just above ground for contact AO
@@ -166,6 +167,9 @@ void RaycastWorld::Cleanup() {
     m_connectedComponent.clear();
     m_mainRoadCells.clear();
     m_buildingLots.clear();
+    m_isFromOSM = false;
+    m_osmLandmarks.clear();
+    m_gridStreetNames.clear();
 }
 
 // Precise color classifier based on user's color definitions:
@@ -200,6 +204,229 @@ MapTileType RaycastWorld::ClassifyPixelColor(Color c) const {
 
     // Default: Gedung / Bangunan (#f7f3f2 / white city blocks)
     return TILE_BUILDING;
+}
+
+bool RaycastWorld::GenerateFromOSM(const char* imagePath, const char* osmBinPath, int downscaleFactor) {
+    Cleanup();
+
+    Image img = Fumbo::Assets::LoadImage(imagePath);
+    if (img.data == nullptr) {
+        img = ::LoadImage(imagePath);
+    }
+    if (img.data == nullptr) {
+        TraceLog(LOG_ERROR, "[OSM World] Failed to load map image: %s", imagePath);
+        return false;
+    }
+
+    m_mapTexture = LoadTextureFromImage(img);
+    m_textureLoaded = true;
+
+    m_gridWidth = img.width / downscaleFactor;
+    m_gridHeight = img.height / downscaleFactor;
+    m_cellWorldSize = 1.0f;
+
+    UnloadImage(img);
+
+    int totalCells = m_gridWidth * m_gridHeight;
+    m_grid.assign(totalCells, TILE_BUILDING);
+    m_heights.assign(totalCells, 0.0f);
+    m_gridStreetNames.assign(totalCells, "");
+
+    std::ifstream in(osmBinPath, std::ios::binary);
+    if (!in.is_open()) {
+        TraceLog(LOG_ERROR, "[OSM World] Failed to open OSM binary roads file: %s", osmBinPath);
+        return false;
+    }
+
+    char magic[4];
+    in.read(magic, 4);
+    if (std::memcmp(magic, "OSMR", 4) != 0) {
+        TraceLog(LOG_ERROR, "[OSM World] Invalid magic in OSM binary roads file: %s", osmBinPath);
+        return false;
+    }
+
+    uint32_t version = 0;
+    in.read(reinterpret_cast<char*>(&version), sizeof(version));
+
+    uint32_t numRoads = 0;
+    in.read(reinterpret_cast<char*>(&numRoads), sizeof(numRoads));
+
+    auto markRoadCell = [this](int cx, int cy, int rad, const std::string& streetName) {
+        for (int rdy = -rad; rdy <= rad; rdy++) {
+            for (int rdx = -rad; rdx <= rad; rdx++) {
+                int nx = cx + rdx;
+                int ny = cy + rdy;
+                if (IsValidGrid(nx, ny)) {
+                    int idx = ny * m_gridWidth + nx;
+                    m_grid[idx] = TILE_ROAD;
+                    if (!streetName.empty() && m_gridStreetNames[idx].empty()) {
+                        m_gridStreetNames[idx] = streetName;
+                    }
+                }
+            }
+        }
+    };
+
+    for (uint32_t r = 0; r < numRoads; r++) {
+        uint16_t nameLen = 0;
+        in.read(reinterpret_cast<char*>(&nameLen), sizeof(nameLen));
+        std::string name(nameLen, '\0');
+        if (nameLen > 0) {
+            in.read(&name[0], nameLen);
+        }
+
+        uint8_t hwType = 0;
+        in.read(reinterpret_cast<char*>(&hwType), sizeof(hwType));
+
+        uint16_t numPts = 0;
+        in.read(reinterpret_cast<char*>(&numPts), sizeof(numPts));
+
+        std::vector<Vector2> pts(numPts);
+        for (uint16_t p = 0; p < numPts; p++) {
+            in.read(reinterpret_cast<char*>(&pts[p].x), sizeof(float));
+            in.read(reinterpret_cast<char*>(&pts[p].y), sizeof(float));
+        }
+
+        // Primary & secondary roads are 3 cells wide (rad=1); others are 1 cell wide (rad=0)
+        int rad = (hwType <= 1) ? 1 : 0;
+        for (size_t i = 0; i + 1 < pts.size(); i++) {
+            int x0 = (int)roundf(pts[i].x * (m_gridWidth - 1));
+            int y0 = (int)roundf(pts[i].y * (m_gridHeight - 1));
+            int x1 = (int)roundf(pts[i+1].x * (m_gridWidth - 1));
+            int y1 = (int)roundf(pts[i+1].y * (m_gridHeight - 1));
+
+            int dx = std::abs(x1 - x0);
+            int dy = std::abs(y1 - y0);
+            int sx = (x0 < x1) ? 1 : -1;
+            int sy = (y0 < y1) ? 1 : -1;
+            int err = dx - dy;
+            int x = x0;
+            int y = y0;
+
+            while (true) {
+                markRoadCell(x, y, rad, name);
+                if (x == x1 && y == y1) break;
+                int e2 = 2 * err;
+                if (e2 > -dy) {
+                    err -= dy;
+                    x += sx;
+                    markRoadCell(x, y, rad, name);
+                }
+                if (e2 < dx) {
+                    err += dx;
+                    y += sy;
+                    markRoadCell(x, y, rad, name);
+                }
+            }
+        }
+    }
+
+    // Read Waterways
+    uint32_t numWaterways = 0;
+    if (in.read(reinterpret_cast<char*>(&numWaterways), sizeof(numWaterways))) {
+        for (uint32_t w = 0; w < numWaterways; w++) {
+            uint16_t nameLen = 0;
+            in.read(reinterpret_cast<char*>(&nameLen), sizeof(nameLen));
+            std::string name(nameLen, '\0');
+            if (nameLen > 0) in.read(&name[0], nameLen);
+
+            uint16_t numPts = 0;
+            in.read(reinterpret_cast<char*>(&numPts), sizeof(numPts));
+            std::vector<Vector2> pts(numPts);
+            for (uint16_t p = 0; p < numPts; p++) {
+                in.read(reinterpret_cast<char*>(&pts[p].x), sizeof(float));
+                in.read(reinterpret_cast<char*>(&pts[p].y), sizeof(float));
+            }
+
+            for (size_t i = 0; i + 1 < pts.size(); i++) {
+                int x0 = (int)roundf(pts[i].x * (m_gridWidth - 1));
+                int y0 = (int)roundf(pts[i].y * (m_gridHeight - 1));
+                int x1 = (int)roundf(pts[i+1].x * (m_gridWidth - 1));
+                int y1 = (int)roundf(pts[i+1].y * (m_gridHeight - 1));
+
+                int dx = std::abs(x1 - x0);
+                int dy = std::abs(y1 - y0);
+                int sx = (x0 < x1) ? 1 : -1;
+                int sy = (y0 < y1) ? 1 : -1;
+                int err = dx - dy;
+                int x = x0, y = y0;
+
+                while (true) {
+                    if (IsValidGrid(x, y)) {
+                        int idx = y * m_gridWidth + x;
+                        if (m_grid[idx] != TILE_ROAD) {
+                            m_grid[idx] = TILE_RIVER;
+                        }
+                    }
+                    if (x == x1 && y == y1) break;
+                    int e2 = 2 * err;
+                    if (e2 > -dy) { err -= dy; x += sx; }
+                    if (e2 < dx) { err += dx; y += sy; }
+                }
+            }
+        }
+    }
+
+    // Read Landmarks (version >= 2)
+    m_osmLandmarks.clear();
+    if (version >= 2) {
+        uint32_t numLandmarks = 0;
+        if (in.read(reinterpret_cast<char*>(&numLandmarks), sizeof(numLandmarks))) {
+            for (uint32_t l = 0; l < numLandmarks; l++) {
+                uint16_t nameLen = 0;
+                in.read(reinterpret_cast<char*>(&nameLen), sizeof(nameLen));
+                std::string name(nameLen, '\0');
+                if (nameLen > 0) in.read(&name[0], nameLen);
+
+                uint8_t lmType = 0;
+                in.read(reinterpret_cast<char*>(&lmType), sizeof(lmType));
+
+                float u = 0, v = 0;
+                in.read(reinterpret_cast<char*>(&u), sizeof(float));
+                in.read(reinterpret_cast<char*>(&v), sizeof(float));
+
+                int targetGx = (int)roundf(u * (m_gridWidth - 1));
+                int targetGy = (int)roundf(v * (m_gridHeight - 1));
+
+                Vector2 bestRoad = {(float)targetGx, (float)targetGy};
+                float bestDist = 1e9f;
+                for (int dy = -25; dy <= 25; dy++) {
+                    for (int dx = -25; dx <= 25; dx++) {
+                        int nx = targetGx + dx;
+                        int ny = targetGy + dy;
+                        if (IsValidGrid(nx, ny) && m_grid[ny * m_gridWidth + nx] == TILE_ROAD) {
+                            float d = (float)(dx * dx + dy * dy);
+                            if (d < bestDist) {
+                                bestDist = d;
+                                bestRoad = {(float)nx, (float)ny};
+                            }
+                        }
+                    }
+                }
+
+                OSMLandmark lm;
+                lm.name = name;
+                lm.type = lmType;
+                lm.normPos = {u, v};
+                lm.gridPos = bestRoad;
+                m_osmLandmarks.push_back(lm);
+            }
+        }
+    }
+
+    // Analyze connected road network
+    AnalyzeRoadConnectivity();
+
+    // Group adjacent building cells into realistic lot footprints
+    PartitionBuildingLots();
+
+    // Procedurally generate 3D meshes with baked ambient occlusion
+    BuildProceduralMeshes();
+
+    m_isFromOSM = true;
+    TraceLog(LOG_INFO, "[OSM World] Procedural 3D World generated from authentic OpenStreetMap road vectors: %dx%d cells, %d roads, %d landmarks",
+             m_gridWidth, m_gridHeight, (int)m_mainRoadCells.size(), (int)m_osmLandmarks.size());
+    return true;
 }
 
 bool RaycastWorld::GenerateFromImage(const char* imagePath, int downscaleFactor) {
@@ -840,4 +1067,28 @@ std::vector<RayHitResult> RaycastWorld::CastLidarRays(Vector3 origin, float head
     }
 
     return hits;
+}
+
+
+std::string RaycastWorld::GetStreetNameAt(int gx, int gy) const {
+    if (!IsValidGrid(gx, gy)) return "";
+    int idx = gy * m_gridWidth + gx;
+    if (idx < (int)m_gridStreetNames.size() && !m_gridStreetNames[idx].empty()) {
+        return m_gridStreetNames[idx];
+    }
+    for (int r = 1; r <= 3; r++) {
+        for (int dy = -r; dy <= r; dy++) {
+            for (int dx = -r; dx <= r; dx++) {
+                int nx = gx + dx;
+                int ny = gy + dy;
+                if (IsValidGrid(nx, ny)) {
+                    int nIdx = ny * m_gridWidth + nx;
+                    if (nIdx < (int)m_gridStreetNames.size() && !m_gridStreetNames[nIdx].empty()) {
+                        return m_gridStreetNames[nIdx];
+                    }
+                }
+            }
+        }
+    }
+    return "Jalan Lokal Pondok Labu";
 }
