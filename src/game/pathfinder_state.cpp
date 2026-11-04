@@ -16,7 +16,11 @@ static const Color LEG_COLORS[] = {
     {242, 153, 0, 255},   // Stop 3: Google Maps Amber/Orange (#F29900)
     {147, 52, 232, 255},  // Stop 4: Google Maps Royal Purple (#9334E8)
     {229, 37, 146, 255},  // Stop 5: Google Maps Pink/Magenta (#E52592)
-    {0, 180, 216, 255}    // Stop 6: Google Maps Cyan/Teal
+    {0, 180, 216, 255},   // Stop 6: Google Maps Cyan/Teal (#00B4D8)
+    {230, 81, 0, 255},    // Stop 7: Deep Coral (#E65100)
+    {0, 150, 136, 255},   // Stop 8: Teal (#009688)
+    {124, 77, 255, 255},  // Stop 9: Violet (#7C4DFF)
+    {216, 27, 96, 255}    // Stop 10: Rose (#D81B60)
 };
 
 static const Color LEG_DARK_COLORS[] = {
@@ -25,11 +29,15 @@ static const Color LEG_DARK_COLORS[] = {
     {190, 115, 0, 255},
     {110, 35, 180, 255},
     {170, 20, 100, 255},
-    {0, 130, 160, 255}
+    {0, 130, 160, 255},
+    {180, 60, 0, 255},
+    {0, 110, 100, 255},
+    {90, 50, 200, 255},
+    {160, 15, 70, 255}
 };
 
 static const char* LEG_COLOR_NAMES[] = {
-    "Biru", "Hijau", "Oranye", "Ungu", "Pink", "Cyan"
+    "Biru", "Hijau", "Oranye", "Ungu", "Pink", "Cyan", "Koral", "Teal", "Violet", "Rose"
 };
 
 // UI Button Helper
@@ -226,7 +234,8 @@ void PathfinderState::Init() {
     m_camera.projection = CAMERA_PERSPECTIVE;
     m_camMode = APP_CAM_FOLLOW_CAR;
 
-    // 4. Randomize initial positions & solve MBG multi-school routing
+    // 4. Set initial school count to 7 (Pangkalan Jati schools) & solve MBG multi-school routing
+    m_numSchools = 7;
     RandomizePositions();
 
     m_isDriving = true;
@@ -494,13 +503,18 @@ void PathfinderState::RandomizePositions() {
         }
 
         m_schools.clear();
-        for (int i = 0; i < m_numSchools && i < (int)availableIndices.size(); i++) {
-            int lmIdx = availableIndices[i];
+        m_totalOmprengNeeded = 0;
+        int maxAvailable = (int)osmLms.size() - 1;
+        int targetCount = std::min(m_numSchools, maxAvailable);
+
+        for (int i = 0; i < targetCount; i++) {
+            int lmIdx = 1 + (i % maxAvailable);
             Vector2 gPos = osmLms[lmIdx].gridPos;
 
             SchoolDestination sch;
             sch.id = i + 1;
             sch.name = osmLms[lmIdx].name;
+            sch.omprengDemand = (osmLms[lmIdx].demand > 0) ? osmLms[lmIdx].demand : 200;
             sch.streetName = m_world.GetStreetNameAt((int)gPos.x, (int)gPos.y);
             sch.gridPos = gPos;
             sch.worldPos = m_world.GridToWorld(gPos.x, gPos.y, 0.0f);
@@ -510,10 +524,11 @@ void PathfinderState::RandomizePositions() {
             sch.window.start = std::max(10, baseMins - 10);
             sch.window.end   = baseMins + 75 + i * 25;
             sch.unloadTime   = 5;
-            sch.color        = LEG_COLORS[i % 6];
-            sch.darkColor    = LEG_DARK_COLORS[i % 6];
+            sch.color        = LEG_COLORS[i % 10];
+            sch.darkColor    = LEG_DARK_COLORS[i % 10];
             sch.reached      = false;
             m_schools.push_back(sch);
+            m_totalOmprengNeeded += sch.omprengDemand;
         }
     } else {
         // 1. Pick SPPG location
@@ -595,6 +610,11 @@ void PathfinderState::RandomizePositions() {
     m_arrivalTimer = 0.0f;
     m_currentLegIndex = 0;
     m_legDriveProgress = 0.0f;
+    m_truckCurrentOmpreng = m_truckMaxCapacity;
+    m_totalOmprengDelivered = 0;
+    m_currentTripIndex = 0;
+    m_isReloading = false;
+    m_reloadTimer = 0.0f;
 
     // Orient camera and car towards first waypoint
     if (!m_routeLegs.empty() && m_routeLegs[0].path.worldWaypoints.size() >= 2) {
@@ -718,97 +738,114 @@ void PathfinderState::OptimizeAndBuildRoutes() {
     // Update colors and build optimization log
     m_optimizationLog = "MBG: SPPG (Dapur)";
     for (size_t i = 0; i < m_schools.size(); i++) {
-        m_schools[i].color = LEG_COLORS[i % 6];
-        m_schools[i].darkColor = LEG_DARK_COLORS[i % 6];
+        m_schools[i].color = LEG_COLORS[i % 10];
+        m_schools[i].darkColor = LEG_DARK_COLORS[i % 10];
         m_schools[i].reached = false;
-    m_optimizationLog += TextFormat(" -> [%d] %s (%s)", (int)i + 1, m_schools[i].name.c_str(), LEG_COLOR_NAMES[i]);
+        m_optimizationLog += TextFormat(" -> [%d] %s (%s)", (int)i + 1, m_schools[i].name.c_str(), LEG_COLOR_NAMES[i % 10]);
     }
 
-    // Build the routes and 3D colored ribbon meshes for each leg
-    int prevId = 0; // SPPG
-    for (size_t i = 0; i < m_schools.size(); i++) {
-        int curId = m_schools[i].id;
+    // Multi-Trip Capacitated MBG Delivery Grouping:
+    // Kapasitas mobil: 600 ompreng per trip.
+    // 1 kali pengiriman: 2 sampai 3 sekolah.
+    // Jika muatan ompreng tidak cukup untuk sekolah berikutnya -> Kembali ke SPPG UPNVJ untuk reload!
+    struct TripPlan {
+        int tripIndex;
+        std::vector<int> schoolIndices; // indices into m_schools
+        int totalOmpreng;
+    };
 
-        RouteLeg leg;
-        leg.legIndex = (int)i;
-        leg.targetSchoolIndex = (int)i;
-        leg.destinationName = m_schools[i].name;
-        leg.color = m_schools[i].color;
-        leg.isReturnToDepot = false;
+    std::vector<TripPlan> trips;
+    TripPlan currentTrip;
+    currentTrip.tripIndex = 0;
+    currentTrip.totalOmpreng = 0;
 
-        Vector2 startPos = (prevId == 0) ? m_carStartGridPos : m_schools[i - 1].gridPos;
-        Vector2 goalPos = m_schools[i].gridPos;
-        std::string startName = (prevId == 0) ? m_depotName : m_schools[i - 1].name;
-        std::string goalName = m_schools[i].name;
-        leg.osmNav = OSMService::Instance().QueryRoute(startPos, goalPos, m_world.GetGridWidth(), m_world.GetGridHeight(), startName, goalName);
-
-        // Retrieve road path from cache or compute
-        std::pair<int, int> key1 = {prevId, curId};
-        std::pair<int, int> key2 = {curId, prevId};
-
-        if (pathCache.count(key1)) {
-            leg.path = pathCache[key1];
-        } else if (pathCache.count(key2)) {
-            leg.path = pathCache[key2];
-            std::reverse(leg.path.gridPath.begin(), leg.path.gridPath.end());
-            std::reverse(leg.path.worldWaypoints.begin(), leg.path.worldWaypoints.end());
-            std::reverse(leg.path.waypointInTraffic.begin(), leg.path.waypointInTraffic.end());
-        } else {
-            leg.path = m_pathfinder.FindShortestPath(m_world, startPos, goalPos, m_gridPathAlgo, blocked, traffic);
+    for (int i = 0; i < (int)m_schools.size(); i++) {
+        int dem = m_schools[i].omprengDemand;
+        // Group into 2-3 schools <= 600 ompreng
+        if (!currentTrip.schoolIndices.empty() && 
+            (currentTrip.schoolIndices.size() >= 3 || (currentTrip.totalOmpreng + dem > m_truckMaxCapacity))) {
+            trips.push_back(currentTrip);
+            currentTrip.tripIndex = (int)trips.size();
+            currentTrip.schoolIndices.clear();
+            currentTrip.totalOmpreng = 0;
         }
+        currentTrip.schoolIndices.push_back(i);
+        currentTrip.totalOmpreng += dem;
+        m_schools[i].tripIndex = currentTrip.tripIndex;
+    }
+    if (!currentTrip.schoolIndices.empty()) {
+        trips.push_back(currentTrip);
+    }
+    m_totalTrips = (int)trips.size();
 
-        // Compute original intended path (WITHOUT road blockades/tents)
-        PathResult origPath = m_pathfinder.FindShortestPath(m_world, startPos, goalPos, m_gridPathAlgo, {}, traffic);
-        leg.originalPath = origPath;
-        leg.originalDistanceKm = origPath.totalDistanceWorld * 0.045f;
-        leg.detourDistanceKm = leg.path.totalDistanceWorld * 0.045f;
+    // Helper lambda to construct and add a RouteLeg
+    auto addLeg = [&](Vector2 startPos, Vector2 goalPos, std::string startName, std::string goalName,
+                      int targetSchoolIdx, Color col, bool isReturn, bool isReload, int tripIdx,
+                      int omprengBefore, int omprengUnload) {
+        RouteLeg leg;
+        leg.legIndex = (int)m_routeLegs.size();
+        leg.targetSchoolIndex = targetSchoolIdx;
+        leg.destinationName = goalName;
+        leg.color = col;
+        leg.isReturnToDepot = isReturn;
+        leg.isReloadDepot = isReload;
+        leg.tripIndex = tripIdx;
+        leg.omprengBeforeLeg = omprengBefore;
+        leg.omprengUnloaded = omprengUnload;
+        leg.omprengAfterLeg = std::max(0, omprengBefore - omprengUnload);
 
-        // Detect if detour is taken
-        bool isDifferent = (origPath.gridPath.size() != leg.path.gridPath.size());
-        if (!isDifferent) {
-            for (size_t k = 0; k < origPath.gridPath.size(); k++) {
-                if (origPath.gridPath[k].x != leg.path.gridPath[k].x ||
-                    origPath.gridPath[k].y != leg.path.gridPath[k].y) {
-                    isDifferent = true;
-                    break;
+        leg.osmNav = OSMService::Instance().QueryRoute(startPos, goalPos, m_world.GetGridWidth(), m_world.GetGridHeight(), startName, goalName);
+        leg.path = m_pathfinder.FindShortestPath(m_world, startPos, goalPos, m_gridPathAlgo, blocked, traffic);
+
+        if (m_obstaclesEnabled) {
+            PathResult origP = m_pathfinder.FindShortestPath(m_world, startPos, goalPos, m_gridPathAlgo, {}, traffic);
+            leg.originalPath = origP;
+            leg.originalDistanceKm = origP.totalDistanceWorld * 0.045f;
+            leg.detourDistanceKm = leg.path.totalDistanceWorld * 0.045f;
+
+            bool isDiff = (origP.gridPath.size() != leg.path.gridPath.size());
+            if (!isDiff) {
+                for (size_t k = 0; k < origP.gridPath.size(); k++) {
+                    if (origP.gridPath[k].x != leg.path.gridPath[k].x ||
+                        origP.gridPath[k].y != leg.path.gridPath[k].y) {
+                        isDiff = true;
+                        break;
+                    }
                 }
             }
-        }
 
-        leg.hasDetour = (m_obstaclesEnabled && isDifferent);
-        if (leg.hasDetour) {
-            leg.extraDetourKm = std::max(0.0f, leg.detourDistanceKm - leg.originalDistanceKm);
-            leg.extraDetourMinutes = leg.extraDetourKm * 2.5f;
+            leg.hasDetour = isDiff;
+            if (leg.hasDetour) {
+                leg.extraDetourKm = std::max(0.0f, leg.detourDistanceKm - leg.originalDistanceKm);
+                leg.extraDetourMinutes = leg.extraDetourKm * 2.5f;
 
-            // Find branch point (where detour diverges from original path)
-            size_t branchIdx = 0;
-            while (branchIdx < leg.path.gridPath.size() && branchIdx < origPath.gridPath.size() &&
-                   leg.path.gridPath[branchIdx].x == origPath.gridPath[branchIdx].x &&
-                   leg.path.gridPath[branchIdx].y == origPath.gridPath[branchIdx].y) {
-                branchIdx++;
-            }
-            if (branchIdx > 0 && branchIdx <= leg.path.gridPath.size()) {
-                leg.detourBranchGrid = leg.path.gridPath[branchIdx - 1];
-            }
+                size_t branchIdx = 0;
+                while (branchIdx < leg.path.gridPath.size() && branchIdx < origP.gridPath.size() &&
+                       leg.path.gridPath[branchIdx].x == origP.gridPath[branchIdx].x &&
+                       leg.path.gridPath[branchIdx].y == origP.gridPath[branchIdx].y) {
+                    branchIdx++;
+                }
+                if (branchIdx > 0 && branchIdx <= leg.path.gridPath.size()) {
+                    leg.detourBranchGrid = leg.path.gridPath[branchIdx - 1];
+                }
 
-            // Find merge point (where detour rejoins original path)
-            int endDetour = (int)leg.path.gridPath.size() - 1;
-            int endOrig = (int)origPath.gridPath.size() - 1;
-            while (endDetour >= 0 && endOrig >= 0 &&
-                   leg.path.gridPath[endDetour].x == origPath.gridPath[endOrig].x &&
-                   leg.path.gridPath[endDetour].y == origPath.gridPath[endOrig].y) {
-                endDetour--;
-                endOrig--;
-            }
-            if (endDetour + 1 < (int)leg.path.gridPath.size()) {
-                leg.detourMergeGrid = leg.path.gridPath[endDetour + 1];
-            }
+                int endDetour = (int)leg.path.gridPath.size() - 1;
+                int endOrig = (int)origP.gridPath.size() - 1;
+                while (endDetour >= 0 && endOrig >= 0 &&
+                       leg.path.gridPath[endDetour].x == origP.gridPath[endOrig].x &&
+                       leg.path.gridPath[endDetour].y == origP.gridPath[endOrig].y) {
+                    endDetour--;
+                    endOrig--;
+                }
+                if (endDetour + 1 < (int)leg.path.gridPath.size()) {
+                    leg.detourMergeGrid = leg.path.gridPath[endDetour + 1];
+                }
 
-            // Build 3D hazard-striped ribbon for the original blocked route
-            if (origPath.found && origPath.gridPath.size() >= 2) {
-                leg.origBlockedModel = m_pathfinder.BuildPathMeshModel(
-                    m_world, origPath.gridPath, (Color){230, 45, 45, 200}, {}, 0.40f, 0.09f, false, true);
-                leg.origModelLoaded = true;
+                if (origP.found && origP.gridPath.size() >= 2) {
+                    leg.origBlockedModel = m_pathfinder.BuildPathMeshModel(
+                        m_world, origP.gridPath, (Color){230, 45, 45, 200}, {}, 0.40f, 0.09f, false, true);
+                    leg.origModelLoaded = true;
+                }
             }
         }
 
@@ -817,87 +854,42 @@ void PathfinderState::OptimizeAndBuildRoutes() {
         m_totalExecutionTimeMs += leg.path.executionTimeMs;
 
         if (leg.path.found && leg.path.gridPath.size() >= 2) {
-            // 1. Crisp white underlay border
             leg.borderModel = m_pathfinder.BuildPathMeshModel(m_world, leg.path.gridPath, WHITE, leg.path.waypointInTraffic, 0.70f, 0.08f, true);
-            // 2. Core colored ribbon for this school leg (traffic = RED, clear = leg.color)
             leg.pathModel = m_pathfinder.BuildPathMeshModel(m_world, leg.path.gridPath, leg.color, leg.path.waypointInTraffic, 0.48f, 0.14f, false);
             leg.modelsLoaded = true;
         }
 
         m_routeLegs.push_back(leg);
-        prevId = curId;
-    }
+    };
 
-    // =========================================================================
-    // FINAL STEP: Mobil kembali ke titik awal (SPPG / Dapur Pusat)!
-    // Setelah semua sekolah dikunjungi, truk kembali ke pangkalan
-    // =========================================================================
-    if (!m_schools.empty()) {
-        int lastSchoolId = m_schools.back().id;
-        RouteLeg returnLeg;
-        returnLeg.legIndex = (int)m_schools.size();
-        returnLeg.targetSchoolIndex = -1;
-        returnLeg.destinationName = m_depotName;
-        returnLeg.color = (Color){255, 185, 0, 255}; // Vibrant Amber/Gold matching SPPG
-        returnLeg.isReturnToDepot = true;
+    // Construct legs for all trips
+    for (size_t t = 0; t < trips.size(); t++) {
+        const auto& trip = trips[t];
+        int truckOmpreng = m_truckMaxCapacity;
+        Vector2 prevPos = m_carStartGridPos;
+        std::string prevName = m_depotName;
 
-        Vector2 startPos = m_schools.back().gridPos;
-        Vector2 goalPos = m_carStartGridPos;
-        returnLeg.osmNav = OSMService::Instance().QueryRoute(startPos, goalPos, m_world.GetGridWidth(), m_world.GetGridHeight(), m_schools.back().name, m_depotName);
+        for (int sIdx : trip.schoolIndices) {
+            Vector2 goalPos = m_schools[sIdx].gridPos;
+            std::string goalName = m_schools[sIdx].name;
+            int demand = m_schools[sIdx].omprengDemand;
 
-        std::pair<int, int> key1 = {lastSchoolId, 0};
-        std::pair<int, int> key2 = {0, lastSchoolId};
-
-        if (pathCache.count(key1)) {
-            returnLeg.path = pathCache[key1];
-        } else if (pathCache.count(key2)) {
-            returnLeg.path = pathCache[key2];
-            std::reverse(returnLeg.path.gridPath.begin(), returnLeg.path.gridPath.end());
-            std::reverse(returnLeg.path.worldWaypoints.begin(), returnLeg.path.worldWaypoints.end());
-            std::reverse(returnLeg.path.waypointInTraffic.begin(), returnLeg.path.waypointInTraffic.end());
-        } else {
-            returnLeg.path = m_pathfinder.FindShortestPath(m_world, startPos, goalPos, m_gridPathAlgo, blocked, traffic);
+            addLeg(prevPos, goalPos, prevName, goalName, sIdx, m_schools[sIdx].color, false, false, (int)t,
+                   truckOmpreng, demand);
+            truckOmpreng -= demand;
+            prevPos = goalPos;
+            prevName = goalName;
         }
 
-        // Check detour on return leg
-        PathResult origRetPath = m_pathfinder.FindShortestPath(m_world, startPos, goalPos, m_gridPathAlgo, {}, traffic);
-        returnLeg.originalPath = origRetPath;
-        returnLeg.originalDistanceKm = origRetPath.totalDistanceWorld * 0.045f;
-        returnLeg.detourDistanceKm = returnLeg.path.totalDistanceWorld * 0.045f;
+        // Return leg to SPPG Kampus UPNVJ
+        bool isFinalTrip = (t == trips.size() - 1);
+        std::string returnGoalName = isFinalTrip ?
+            TextFormat("%s (Selesai Distribusi)", m_depotName.c_str()) :
+            TextFormat("%s (Reload 600 Ompreng)", m_depotName.c_str());
 
-        bool retDiff = (origRetPath.gridPath.size() != returnLeg.path.gridPath.size());
-        if (!retDiff) {
-            for (size_t k = 0; k < origRetPath.gridPath.size(); k++) {
-                if (origRetPath.gridPath[k].x != returnLeg.path.gridPath[k].x ||
-                    origRetPath.gridPath[k].y != returnLeg.path.gridPath[k].y) {
-                    retDiff = true;
-                    break;
-                }
-            }
-        }
-        returnLeg.hasDetour = (m_obstaclesEnabled && retDiff);
-        if (returnLeg.hasDetour) {
-            returnLeg.extraDetourKm = std::max(0.0f, returnLeg.detourDistanceKm - returnLeg.originalDistanceKm);
-            returnLeg.extraDetourMinutes = returnLeg.extraDetourKm * 2.5f;
-            if (origRetPath.found && origRetPath.gridPath.size() >= 2) {
-                returnLeg.origBlockedModel = m_pathfinder.BuildPathMeshModel(
-                    m_world, origRetPath.gridPath, (Color){230, 45, 45, 200}, {}, 0.40f, 0.09f, false, true);
-                returnLeg.origModelLoaded = true;
-            }
-        }
-
-        m_totalRouteDistance += returnLeg.path.totalDistanceWorld;
-        m_totalNodesExplored += returnLeg.path.nodesExplored;
-        m_totalExecutionTimeMs += returnLeg.path.executionTimeMs;
-
-        if (returnLeg.path.found && returnLeg.path.gridPath.size() >= 2) {
-            returnLeg.borderModel = m_pathfinder.BuildPathMeshModel(m_world, returnLeg.path.gridPath, WHITE, returnLeg.path.waypointInTraffic, 0.70f, 0.08f, true);
-            returnLeg.pathModel = m_pathfinder.BuildPathMeshModel(m_world, returnLeg.path.gridPath, returnLeg.color, returnLeg.path.waypointInTraffic, 0.48f, 0.14f, false);
-            returnLeg.modelsLoaded = true;
-        }
-
-        m_routeLegs.push_back(returnLeg);
-    m_optimizationLog += " -> [Akhir] SPPG (Kembali ke Titik Awal)";
+        Color retColor = isFinalTrip ? (Color){255, 185, 0, 255} : (Color){255, 200, 60, 220};
+        addLeg(prevPos, m_carStartGridPos, prevName, returnGoalName, -1, retColor,
+               isFinalTrip, !isFinalTrip, (int)t, truckOmpreng, 0);
     }
 
     // Preserve car driving progress on current leg if car was already moving
@@ -930,8 +922,16 @@ void PathfinderState::UpdateNavigationStatus() {
         return;
     }
 
+    if (m_isReloading) {
+        m_turnInstruction = TextFormat("Muat Ulang 600 Ompreng (%s)", m_depotName.c_str());
+        return;
+    }
+
     if (m_isUnloading) {
-        m_turnInstruction = TextFormat("Bongkar Muatan MBG (%s)", m_schools[m_currentLegIndex].name.c_str());
+        const auto& curLeg = m_routeLegs[m_currentLegIndex];
+        int sIdx = curLeg.targetSchoolIndex;
+        std::string dest = (sIdx >= 0 && sIdx < (int)m_schools.size()) ? m_schools[sIdx].name : curLeg.destinationName;
+        m_turnInstruction = TextFormat("Bongkar Muatan MBG (%s)", dest.c_str());
         return;
     }
 
@@ -1052,19 +1052,37 @@ void PathfinderState::UpdateCarDriving(float dt) {
     // Dynamic movement speed scaled by km/h and simulation speed multiplier
     m_driveSpeed = std::max(0.0f, (m_carCurrentSpeedKmh / 45.0f) * 10.5f * m_simSpeedMultiplier);
 
+    // Handle reload simulation at SPPG Kampus UPNVJ
+    if (m_isReloading) {
+        m_reloadTimer -= dt * m_simSpeedMultiplier;
+        m_carTargetSpeedKmh = 0.0f;
+        m_speedStatusStr = "Muat Ulang Ompreng (0 km/j)";
+        if (m_reloadTimer <= 0.0f) {
+            m_isReloading = false;
+            m_truckCurrentOmpreng = m_truckMaxCapacity; // Reload 600 ompreng!
+            if (m_currentLegIndex + 1 < (int)m_routeLegs.size()) {
+                m_currentLegIndex++;
+                m_legDriveProgress = 0.0f;
+                m_currentTripIndex = m_routeLegs[m_currentLegIndex].tripIndex;
+            }
+        }
+        UpdateNavigationStatus();
+        return;
+    }
+
     // Handle unloading simulation at school
     if (m_isUnloading) {
         m_unloadTimer -= dt * m_simSpeedMultiplier;
         if (m_unloadTimer <= 0.0f) {
             m_isUnloading = false;
-            // Transition to next leg (could be next school OR return to SPPG!)
             if (m_currentLegIndex + 1 < (int)m_routeLegs.size()) {
                 m_currentLegIndex++;
                 m_legDriveProgress = 0.0f;
-                if (m_routeLegs[m_currentLegIndex].isReturnToDepot) {
+                m_currentTripIndex = m_routeLegs[m_currentLegIndex].tripIndex;
+                if (m_routeLegs[m_currentLegIndex].isReloadDepot) {
+                    TraceLog(LOG_INFO, "Ompreng habis/kurang! Truk kembali ke SPPG UPNVJ untuk reload 600 ompreng...");
+                } else if (m_routeLegs[m_currentLegIndex].isReturnToDepot) {
                     TraceLog(LOG_INFO, "Semua sekolah selesai! Mobil sedang kembali ke titik awal (SPPG)...");
-                } else {
-                    TraceLog(LOG_INFO, "Unloading done! Now driving to School %d...", m_currentLegIndex + 1);
                 }
             } else {
                 m_allDelivered = true;
@@ -1088,14 +1106,22 @@ void PathfinderState::UpdateCarDriving(float dt) {
     if (nextIdx >= numWp) {
         m_carCurrentPos = curLeg.path.worldWaypoints.back();
 
+        if (curLeg.isReloadDepot) {
+            // ARRIVED AT SPPG FOR OMPRENG RELOAD!
+            m_isReloading = true;
+            m_reloadTimer = 2.0f;
+            UpdateNavigationStatus();
+            return;
+        }
+
         if (curLeg.isReturnToDepot) {
-            // ARRIVED BACK AT STARTING POINT (SPPG)!
+            // ARRIVED BACK AT STARTING POINT (SPPG) - ALL DELIVERIES COMPLETED!
             m_allDelivered = true;
             m_distanceToCurrentTarget = 0.0f;
             m_totalDistanceRemaining = 0.0f;
             m_arrivalTimer += dt * m_simSpeedMultiplier;
             if (m_arrivalTimer >= 4.0f) {
-                RandomizePositions(); // Automatically starts next delivery mission!
+                RandomizePositions();
             }
             UpdateNavigationStatus();
             return;
@@ -1107,7 +1133,9 @@ void PathfinderState::UpdateCarDriving(float dt) {
         }
 
         m_isUnloading = true;
-        m_unloadTimer = 1.5f;
+        m_unloadTimer = 1.8f;
+        m_truckCurrentOmpreng = std::max(0, m_truckCurrentOmpreng - curLeg.omprengUnloaded);
+        m_totalOmprengDelivered += curLeg.omprengUnloaded;
 
         UpdateNavigationStatus();
         return;
@@ -1200,6 +1228,9 @@ void PathfinderState::Update() {
     if (IsKeyPressed(KEY_N)) m_showItinerarySheet = !m_showItinerarySheet;
     if (IsKeyPressed(KEY_P)) m_showLocationModal = !m_showLocationModal;
     if (IsKeyPressed(KEY_V)) SwitchMapMode(!m_world.IsGeneratedFromOSM());
+    if (IsKeyPressed(KEY_F11)) {
+        ToggleFullscreen();
+    }
     if (IsKeyPressed(KEY_ESCAPE)) {
         if (m_showItinerarySheet) m_showItinerarySheet = false;
         else if (m_showLocationModal) m_showLocationModal = false;
@@ -1443,12 +1474,15 @@ void PathfinderState::DrawUI() {
     int navCardH = m_allDelivered ? 100 : 158;
 
     bool isReturningToDepot = (!m_routeLegs.empty() && m_currentLegIndex < (int)m_routeLegs.size() && m_routeLegs[m_currentLegIndex].isReturnToDepot);
+    bool isReloadingAtDepot = (!m_routeLegs.empty() && m_currentLegIndex < (int)m_routeLegs.size() && m_routeLegs[m_currentLegIndex].isReloadDepot);
 
     Color curHeaderBg = m_allDelivered ? (Color){24, 134, 75, 250} :
+                        (m_isReloading ? (Color){220, 130, 20, 250} :
                         (m_isUnloading ? (Color){210, 120, 10, 250} :
+                        (isReloadingAtDepot ? (Color){220, 140, 25, 250} :
                         (isReturningToDepot ? (Color){220, 155, 0, 250} :
                         ((!m_routeLegs.empty() && m_currentLegIndex < (int)m_routeLegs.size()) ?
-                         Fade(m_routeLegs[m_currentLegIndex].color, 0.96f) : (Color){26, 115, 232, 250})));
+                         Fade(m_routeLegs[m_currentLegIndex].color, 0.96f) : (Color){26, 115, 232, 250})))));
 
     DrawRectangleRounded((Rectangle){(float)navCardX, (float)navCardY, (float)navCardW, (float)navCardH}, 0.10f, 6, curHeaderBg);
     DrawRectangleRoundedLinesEx((Rectangle){(float)navCardX, (float)navCardY, (float)navCardW, (float)navCardH}, 0.10f, 6, 2.0f, Fade(WHITE, 0.45f));
@@ -1486,13 +1520,17 @@ void PathfinderState::DrawUI() {
         DrawTextCustom("MISI PENGANTARAN SELESAI!", navCardX + 20, navCardY + 44, 17, WHITE, FONT_BOLD);
         DrawTextCustom(TextFormat("Seluruh %d sekolah terlayani & mobil kembali ke SPPG tepat waktu!", (int)m_schools.size()),
                        navCardX + 20, navCardY + 68, 11.5f, (Color){220, 255, 230, 255}, FONT_REGULAR);
-    } else if (isReturningToDepot) {
+    } else if (isReturningToDepot || isReloadingAtDepot) {
         const char* retIcon = (m_turnInstruction.find("Kanan") != std::string::npos) ? "->" :
                               ((m_turnInstruction.find("Kiri") != std::string::npos) ? "<-" : "^");
         DrawTextCustom(retIcon, navCardX + 20, navCardY + 44, 26, WHITE, FONT_BOLD);
         DrawTextCustom(m_turnInstruction.c_str(), navCardX + 58, navCardY + 42, 16.5f, WHITE, FONT_BOLD);
         DrawTextCustom(TextFormat("Sedang di: %s", m_currentStreetName.c_str()), navCardX + 58, navCardY + 63, 11.5f, (Color){255, 245, 170, 255}, FONT_SEMIBOLD);
-        DrawTextCustom(TextFormat("Langkah Akhir: Kembali ke %s", m_depotName.c_str()), navCardX + 58, navCardY + 81, 11.0f, WHITE, FONT_REGULAR);
+
+        const char* actionStr = isReloadingAtDepot ?
+            TextFormat("Kembali ke SPPG: Muat Ulang 600 Ompreng (Trip %d selesai)", m_currentTripIndex + 1) :
+            TextFormat("Langkah Akhir: Selesai Distribusi di %s", m_depotName.c_str());
+        DrawTextCustom(actionStr, navCardX + 58, navCardY + 81, 11.0f, WHITE, FONT_REGULAR);
 
         float metersCurrent = m_distanceToCurrentTarget * 25.0f;
         float kmCurrent = metersCurrent / 1000.0f;
@@ -1503,7 +1541,8 @@ void PathfinderState::DrawUI() {
         if (m_isCarInTraffic) {
             DrawTextCustom("[!] Zona Macet: Kecepatan mobil turun ke 12 km/jam", navCardX + 58, navCardY + 119, 11.0f, (Color){255, 130, 130, 255}, FONT_BOLD);
         } else {
-            DrawTextCustom("[OK] Menuju pangkalan dapur pusat SPPG", navCardX + 58, navCardY + 119, 11.0f, (Color){230, 255, 220, 255}, FONT_REGULAR);
+            const char* infoSub = isReloadingAtDepot ? "[OK] Menuju SPPG UPNVJ untuk reload muatan 600 ompreng" : "[OK] Menuju pangkalan dapur pusat SPPG";
+            DrawTextCustom(infoSub, navCardX + 58, navCardY + 119, 11.0f, (Color){230, 255, 220, 255}, FONT_REGULAR);
         }
     } else {
         const char* iconStr = m_isUnloading ? ">" :
@@ -1512,9 +1551,11 @@ void PathfinderState::DrawUI() {
         DrawTextCustom(iconStr, navCardX + 20, navCardY + 44, 26, WHITE, FONT_BOLD);
         DrawTextCustom(m_turnInstruction.c_str(), navCardX + 58, navCardY + 42, 16.5f, WHITE, FONT_BOLD);
 
-        int targetId = m_currentLegIndex + 1;
-        const char* colName = (m_currentLegIndex < 6) ? LEG_COLOR_NAMES[m_currentLegIndex] : "Warna";
-        const char* schName = (m_currentLegIndex < (int)m_schools.size()) ? m_schools[m_currentLegIndex].name.c_str() : "Sekolah";
+        const auto& curLeg = m_routeLegs[m_currentLegIndex];
+        int sIdx = curLeg.targetSchoolIndex;
+        int targetId = (sIdx >= 0) ? (sIdx + 1) : (m_currentLegIndex + 1);
+        const char* colName = (sIdx >= 0 && sIdx < 10) ? LEG_COLOR_NAMES[sIdx % 10] : "Warna";
+        const char* schName = (sIdx >= 0 && sIdx < (int)m_schools.size()) ? m_schools[sIdx].name.c_str() : curLeg.destinationName.c_str();
 
         DrawTextCustom(TextFormat("Sedang di: %s", m_currentStreetName.c_str()), navCardX + 58, navCardY + 63, 11.5f, (Color){255, 245, 170, 255}, FONT_SEMIBOLD);
         DrawTextCustom(TextFormat("Tujuan: %s (Stop %d dari %d | Jalur %s)", schName, targetId, (int)m_schools.size(), colName),
@@ -1529,9 +1570,9 @@ void PathfinderState::DrawUI() {
         if (m_isCarInTraffic) {
             DrawTextCustom(TextFormat("[!] Zona Macet (+%.0f mnt delay) - Kecepatan 12 km/jam", m_trafficDelayMinutes),
                            navCardX + 58, navCardY + 119, 11.0f, (Color){255, 140, 140, 255}, FONT_BOLD);
-        } else if (m_currentLegIndex < (int)m_schools.size()) {
-            const auto& w = m_schools[m_currentLegIndex].window;
-            DrawTextCustom(TextFormat("Window Pengantaran: [%d - %d mnt] | Bongkar: 5m", w.start, w.end),
+        } else if (sIdx >= 0 && sIdx < (int)m_schools.size()) {
+            const auto& w = m_schools[sIdx].window;
+            DrawTextCustom(TextFormat("Window Pengantaran: [%d - %d mnt] | Muatan Turun: %d Ompreng", w.start, w.end, curLeg.omprengUnloaded),
                            navCardX + 58, navCardY + 119, 11.0f, (Color){230, 245, 255, 255}, FONT_REGULAR);
         }
     }
@@ -1550,6 +1591,7 @@ void PathfinderState::DrawUI() {
     StateButton btnItinerary = {{(float)toolX + 460,  (float)toolY, 105, 36}, "Rute OSM [N]",     m_showItinerarySheet};
     StateButton btnLocation  = {{(float)toolX + 570,  (float)toolY,  90, 36}, "Lokasi [P]",        m_showLocationModal};
     StateButton btnMap       = {{(float)toolX + 665,  (float)toolY,  85, 36}, m_mapFullscreen ? "Tutup [M]" : "Peta [M]", m_mapFullscreen};
+    StateButton btnFullscreen = {{(float)toolX + 755,  (float)toolY,  90, 36}, IsWindowFullscreen() ? "Window [F11]" : "Full [F11]", IsWindowFullscreen()};
 
     // Row 2 of controls (Obstacles, Traffic, Simulation Speed, School Count, Camera)
     int row2Y = toolY + 42;
@@ -1577,6 +1619,7 @@ void PathfinderState::DrawUI() {
     btnItinerary.Draw(m_fontSemiBold, btnBase, btnHover, (Color){50, 160, 230, 255}, m_showItinerarySheet ? WHITE : BLACK);
     btnLocation.Draw(m_fontSemiBold, btnBase, btnHover, (Color){150, 90, 240, 255}, m_showLocationModal ? WHITE : BLACK);
     btnMap.Draw(m_fontSemiBold, btnBase, btnHover, (Color){30, 144, 255, 255}, m_mapFullscreen ? WHITE : BLACK);
+    btnFullscreen.Draw(m_fontSemiBold, btnBase, btnHover, (Color){120, 140, 220, 255}, IsWindowFullscreen() ? WHITE : BLACK);
 
     btnObstacle.Draw(m_fontSemiBold, btnBase, btnHover, (Color){240, 140, 20, 255}, m_obstaclesEnabled ? WHITE : BLACK);
     btnTraffic.Draw(m_fontSemiBold, btnBase, btnHover, (Color){230, 50, 50, 255}, m_trafficEnabled ? WHITE : BLACK);
@@ -1616,6 +1659,9 @@ void PathfinderState::DrawUI() {
             m_mapZoom = 1.0f;
             m_mapPan = {0, 0};
         }
+    }
+    if (btnFullscreen.IsClicked()) {
+        ToggleFullscreen();
     }
     if (btnObstacle.IsClicked()) {
         m_obstaclesEnabled = !m_obstaclesEnabled;
@@ -1680,7 +1726,7 @@ void PathfinderState::DrawUI() {
     int cardX = 16;
     int cardY = navCardY + navCardH + 10;
     int cardW = 430;
-    int cardH = 300;
+    int cardH = 345;
 
     DrawRectangleRounded((Rectangle){(float)cardX, (float)cardY, (float)cardW, (float)cardH}, 0.08f, 6, Fade((Color){20, 25, 35, 255}, 0.92f));
     DrawRectangleRoundedLinesEx((Rectangle){(float)cardX, (float)cardY, (float)cardW, (float)cardH}, 0.08f, 6, 1.5f, Fade(WHITE, 0.25f));
@@ -1705,39 +1751,51 @@ void PathfinderState::DrawUI() {
     DrawTextCustom("SPPG", cardX + 22, cardY + 76, 10.5f, BLACK, FONT_BOLD);
     DrawTextCustom("Dapur Pusat MBG (Titik Awal)", cardX + 70, cardY + 76, 11.0f, (Color){255, 220, 140, 255}, FONT_REGULAR);
 
-    int rowY = cardY + 96;
+    int rowY = cardY + 94;
     for (size_t i = 0; i < m_schools.size(); i++) {
         const auto& sch = m_schools[i];
-        bool isCurrent = ((int)i == m_currentLegIndex && !m_allDelivered);
+        bool isCurrent = (!m_routeLegs.empty() && m_currentLegIndex < (int)m_routeLegs.size() &&
+                          m_routeLegs[m_currentLegIndex].targetSchoolIndex == (int)i && !m_allDelivered);
         bool isDone = sch.reached;
 
         // Colored badge
-        DrawRectangleRounded((Rectangle){(float)cardX + 16, (float)rowY, 24, 18}, 0.3f, 4, sch.color);
-        DrawTextCustom(TextFormat("%d", (int)i + 1), cardX + 24, rowY + 2, 11, WHITE, FONT_BOLD);
+        DrawRectangleRounded((Rectangle){(float)cardX + 16, (float)rowY, 24, 17}, 0.3f, 4, sch.color);
+        DrawTextCustom(TextFormat("%d", (int)i + 1), cardX + 24, rowY + 1, 10.5f, WHITE, FONT_BOLD);
 
         // Status string
         const char* statusStr = isDone ? "Selesai" : (isCurrent ? (m_isUnloading ? "Bongkar" : "> Menuju") : "Menunggu");
         Color statusColor = isDone ? (Color){100, 240, 130, 255} : (isCurrent ? YELLOW : (Color){180, 190, 205, 255});
 
-        float legMeters = (i < m_routeLegs.size()) ? (m_routeLegs[i].path.totalDistanceWorld * 25.0f) : 0.0f;
-        DrawTextCustom(TextFormat("%s | [%d-%dm] | %.0fm | %s", sch.name.c_str(), sch.window.start, sch.window.end, legMeters, statusStr),
-                       cardX + 46, rowY + 2, 11.0f, statusColor, FONT_REGULAR);
+        float legMeters = 0.0f;
+        for (const auto& leg : m_routeLegs) {
+            if (leg.targetSchoolIndex == (int)i) {
+                legMeters = leg.path.totalDistanceWorld * 25.0f;
+                break;
+            }
+        }
+        DrawTextCustom(TextFormat("%s (%d ompreng) | %.0fm | %s", sch.name.c_str(), sch.omprengDemand, legMeters, statusStr),
+                       cardX + 46, rowY + 1, 10.5f, statusColor, FONT_REGULAR);
 
-        rowY += 20;
+        rowY += 19;
     }
 
-    // Final Step (Kembali ke SPPG)
-    bool isReturnLegCurrent = isReturningToDepot && !m_allDelivered;
-    const char* returnStatusStr = m_allDelivered ? "Tiba di SPPG" : (isReturnLegCurrent ? "> Sedang Kembali" : "Menunggu");
-    Color returnStatusCol = m_allDelivered ? (Color){100, 240, 130, 255} : (isReturnLegCurrent ? (Color){255, 220, 120, 255} : (Color){180, 190, 205, 255});
+    // Reload / Return Step (SPPG)
+    bool isReloadLegCurrent = (!m_routeLegs.empty() && m_currentLegIndex < (int)m_routeLegs.size() &&
+                               m_routeLegs[m_currentLegIndex].isReloadDepot && !m_allDelivered);
+    bool isReturnLegCurrent = (!m_routeLegs.empty() && m_currentLegIndex < (int)m_routeLegs.size() &&
+                               m_routeLegs[m_currentLegIndex].isReturnToDepot && !m_allDelivered);
 
-    float returnMeters = (!m_routeLegs.empty() && m_routeLegs.back().isReturnToDepot) ?
-                         (m_routeLegs.back().path.totalDistanceWorld * 25.0f) : 0.0f;
+    const char* sppgStatusStr = m_allDelivered ? "Tiba di SPPG (Selesai)" :
+                                (isReloadLegCurrent ? (m_isReloading ? "Reload 600 Ompreng" : "> Menuju Reload") :
+                                (isReturnLegCurrent ? "> Sedang Kembali" : "Standby SPPG"));
+    Color sppgStatusCol = m_allDelivered ? (Color){100, 240, 130, 255} :
+                          (isReloadLegCurrent ? (Color){255, 160, 40, 255} :
+                          (isReturnLegCurrent ? (Color){255, 220, 120, 255} : (Color){180, 190, 205, 255}));
 
-    DrawRectangleRounded((Rectangle){(float)cardX + 16, (float)rowY, 24, 18}, 0.3f, 4, (Color){255, 180, 0, 255});
-    DrawTextCustom("0", cardX + 24, rowY + 2, 11, BLACK, FONT_BOLD);
-    DrawTextCustom(TextFormat("Kembali ke SPPG (Titik Awal) | %.0fm | %s", returnMeters, returnStatusStr),
-                   cardX + 46, rowY + 2, 11.0f, returnStatusCol, FONT_REGULAR);
+    DrawRectangleRounded((Rectangle){(float)cardX + 16, (float)rowY, 24, 17}, 0.3f, 4, (Color){255, 180, 0, 255});
+    DrawTextCustom("R", cardX + 24, rowY + 1, 10.5f, BLACK, FONT_BOLD);
+    DrawTextCustom(TextFormat("Pusat SPPG (Kampus UPNVJ) | %s", sppgStatusStr),
+                   cardX + 46, rowY + 1, 10.5f, sppgStatusCol, FONT_REGULAR);
 
     // Performance & Metrics summary
     DrawLine(cardX + 16, cardY + cardH - 56, cardX + cardW - 16, cardY + cardH - 56, Fade(WHITE, 0.15f));
@@ -1749,6 +1807,65 @@ void PathfinderState::DrawUI() {
     DrawTextCustom(TextFormat("States Explored: %d - Runtime: %.1f us - Detour: %s",
                               m_statesExplored, m_optimizationTimeUs, m_obstaclesEnabled ? "Aktif" : "Off"),
                    cardX + 16, cardY + cardH - 24, 10.5f, (Color){140, 230, 255, 255}, FONT_REGULAR);
+
+    // =========================================================================
+    // Kapasitas Mobil MBG & Status Multi-Trip (600 Ompreng max)
+    // =========================================================================
+    {
+        int ompX = 16;
+        int ompY = cardY + cardH + 10;
+        int ompW = 430;
+        int ompH = 95;
+
+        DrawRectangleRounded((Rectangle){(float)ompX, (float)ompY, (float)ompW, (float)ompH}, 0.08f, 6, Fade((Color){20, 25, 35, 255}, 0.94f));
+        DrawRectangleRoundedLinesEx((Rectangle){(float)ompX, (float)ompY, (float)ompW, (float)ompH}, 0.08f, 6, 1.5f, Fade(WHITE, 0.25f));
+
+        DrawTextCustom("KAPASITAS MOBIL MBG (MAX 600 OMPRENG)", ompX + 16, ompY + 10, 12, (Color){255, 210, 80, 255}, FONT_BOLD);
+        DrawTextCustom("1 Kali Pengiriman: 2-3 Sekolah | Jika Kurang Kembali ke SPPG", ompX + 16, ompY + 26, 10, (Color){180, 195, 215, 255}, FONT_REGULAR);
+
+        // Visual Gauge Bar for Truck Capacity
+        float pct = (float)m_truckCurrentOmpreng / (float)m_truckMaxCapacity;
+        pct = std::clamp(pct, 0.0f, 1.0f);
+
+        int barX = ompX + 16;
+        int barY = ompY + 44;
+        int barW = ompW - 32;
+        int barH = 18;
+
+        DrawRectangleRounded((Rectangle){(float)barX, (float)barY, (float)barW, (float)barH}, 0.3f, 4, (Color){40, 48, 65, 255});
+
+        Color barCol = (pct > 0.45f) ? (Color){40, 210, 100, 255} : (pct > 0.20f ? (Color){255, 180, 40, 255} : (Color){240, 60, 60, 255});
+        if (pct > 0.02f) {
+            DrawRectangleRounded((Rectangle){(float)barX, (float)barY, (float)barW * pct, (float)barH}, 0.3f, 4, barCol);
+        }
+        DrawRectangleRoundedLinesEx((Rectangle){(float)barX, (float)barY, (float)barW, (float)barH}, 0.3f, 4, 1.0f, Fade(WHITE, 0.4f));
+
+        const char* barText = TextFormat("Muatan Mobil: %d / %d Ompreng (%.0f%%)", m_truckCurrentOmpreng, m_truckMaxCapacity, pct * 100.0f);
+        DrawTextCustom(barText, barX + (barW - MeasureTextCustom(barText, 10.5f, FONT_BOLD)) * 0.5f, barY + 3, 10.5f, WHITE, FONT_BOLD);
+
+        // Trip & Delivered stats
+        int curTripDisplay = std::min(m_currentTripIndex + 1, m_totalTrips);
+        const char* tripText = TextFormat("Trip: %d / %d", curTripDisplay, m_totalTrips);
+        DrawTextCustom(tripText, ompX + 16, ompY + 70, 11, (Color){100, 210, 255, 255}, FONT_SEMIBOLD);
+
+        const char* delivText = TextFormat("Terkirim: %d / %d Ompreng", m_totalOmprengDelivered, m_totalOmprengNeeded);
+        DrawTextCustom(delivText, ompX + 110, ompY + 70, 11, (Color){200, 220, 245, 255}, FONT_REGULAR);
+
+        // Status pill
+        if (m_isReloading) {
+            DrawRectangleRounded((Rectangle){(float)ompX + ompW - 145, (float)ompY + 67, 130, 20}, 0.3f, 4, (Color){255, 150, 20, 255});
+            DrawTextCustom("[RELOAD SPPG]", ompX + ompW - 130, ompY + 70, 10, BLACK, FONT_BOLD);
+        } else if (m_isUnloading) {
+            DrawRectangleRounded((Rectangle){(float)ompX + ompW - 145, (float)ompY + 67, 130, 20}, 0.3f, 4, (Color){50, 180, 240, 255});
+            DrawTextCustom("[BONGKAR MUATAN]", ompX + ompW - 140, ompY + 70, 10, BLACK, FONT_BOLD);
+        } else if (m_allDelivered) {
+            DrawRectangleRounded((Rectangle){(float)ompX + ompW - 145, (float)ompY + 67, 130, 20}, 0.3f, 4, (Color){40, 200, 90, 255});
+            DrawTextCustom("[SELESAI 100%]", ompX + ompW - 132, ompY + 70, 10, BLACK, FONT_BOLD);
+        } else {
+            DrawRectangleRounded((Rectangle){(float)ompX + ompW - 145, (float)ompY + 67, 130, 20}, 0.3f, 4, (Color){45, 60, 85, 255});
+            DrawTextCustom("Dalam Perjalanan", ompX + ompW - 135, ompY + 70, 10, (Color){190, 210, 240, 255}, FONT_SEMIBOLD);
+        }
+    }
 
     // =========================================================================
     // 4. Real-Time 2D Minimap & Fullscreen Map Overlay

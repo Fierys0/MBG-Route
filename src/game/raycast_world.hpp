@@ -31,6 +31,7 @@ struct OSMLandmark {
     uint8_t type = 0; // 0 = Central Kitchen (Depot), 1 = School
     Vector2 normPos = {0, 0}; // Normalized [0.0, 1.0] across map canvas
     Vector2 gridPos = {0, 0}; // Snapped to nearest connected road grid coordinate
+    int demand = 0;           // Kebutuhan ompreng makanan bergizi
 };
 
 // Procedural 3D City generated via Ray Casting against the map image

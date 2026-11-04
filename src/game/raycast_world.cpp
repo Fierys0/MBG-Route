@@ -404,11 +404,19 @@ bool RaycastWorld::GenerateFromOSM(const char* imagePath, const char* osmBinPath
                     }
                 }
 
+                uint16_t demandVal = 0;
+                if (version >= 3) {
+                    in.read(reinterpret_cast<char*>(&demandVal), sizeof(demandVal));
+                } else {
+                    demandVal = (lmType == 0) ? 0 : 200;
+                }
+
                 OSMLandmark lm;
                 lm.name = name;
                 lm.type = lmType;
                 lm.normPos = {u, v};
                 lm.gridPos = bestRoad;
+                lm.demand = (int)demandVal;
                 m_osmLandmarks.push_back(lm);
             }
         }

@@ -77,20 +77,13 @@ void OSMService::InitPresets() {
         p.maxLon = 106.80920;
         p.depotName = "SPPG Dapur Pusat MBG (Kampus UPNVJ)";
         p.schoolNames = {
-            "SDN Pondok Labu 01 Pagi",
-            "SMPN 85 Jakarta (Pondok Labu)",
-            "SMAN 34 Jakarta",
-            "SMA Al-Izhar Pondok Labu",
-            "Sekolah Charitas Pondok Labu",
-            "SDN Pondok Labu 11 Pagi",
-            "SMAN 66 Jakarta (Pondok Labu)",
-            "SDN Pondok Labu 02 Pagi",
-            "Komplek SDN Pondok Labu 04/09/10",
-            "SMP Negeri 96 Jakarta",
-            "SMK Negeri 41 Jakarta",
-            "SMP Darussalam H. Ipin",
-            "Al Jabr Islamic School",
-            "SDN Pondok Labu 12 Pagi"
+            "SDN 01 Pangkalan Jati",
+            "SDN 02 Pangkalan Jati",
+            "Radatul Janah (MIS Roudlatul Jannah)",
+            "TK/MTs/SMK Syalafiah",
+            "MI Darul Hikmah",
+            "TK Islam Nurul Quran",
+            "SLB Manunggal Jati"
         };
         m_presets.push_back(p);
     }

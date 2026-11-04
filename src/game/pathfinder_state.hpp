@@ -35,6 +35,8 @@ struct SchoolDestination {
     TimeWindow window;        // [start, end] in minutes (jam pengantaran makanan)
     int unloadTime = 5;       // Waktu bongkar muatan makanan bergizi (menit)
     Color color;              // Visual color matching its route leg
+    int omprengDemand = 200;  // Jumlah porsi ompreng untuk sekolah ini
+    int tripIndex = 0;        // Batch / Trip pengiriman (0 = Trip 1, 1 = Trip 2, dst)
     Color darkColor;
     bool reached = false;
 };
@@ -54,6 +56,11 @@ struct RouteLeg {
     Model borderModel;        // White border underlay
     bool modelsLoaded = false;
     bool isReturnToDepot = false; // True if this leg is returning to SPPG (Titik Awal)!
+    bool isReloadDepot = false;   // True if returning to SPPG to reload 600 ompreng!
+    int omprengBeforeLeg = 600;   // Sisa ompreng sebelum leg ini
+    int omprengUnloaded = 0;      // Ompreng yang diturunkan di tujuan leg ini
+    int omprengAfterLeg = 380;    // Sisa ompreng setelah leg ini
+    int tripIndex = 0;            // Index trip (0 = Trip 1, 1 = Trip 2, dst)
 
     // Dynamic Detour & Original Blocked Route Tracking
     bool hasDetour = false;               // True if this leg takes a detour around a blockade
@@ -113,7 +120,17 @@ private:
     // MULTI-SCHOOL CONFIGURATION: Jumlah sekolah tujuan (bisa diubah!)
     // Minimal 3 sekolah sesuai permintaan, default 3, max 5 (MAX_SCHOOLS di Common.h)
     // =========================================================================
-    static const int DEFAULT_NUM_SCHOOLS = 3;
+    static const int DEFAULT_NUM_SCHOOLS = 7; // Default 7 sekolah Pangkalan Jati
+
+    // Kapasitas Mobil MBG & Multi-Trip Delivery Simulation (600 Ompreng max)
+    int m_truckMaxCapacity = 600;       // Kapasitas maksimum 600 ompreng per trip
+    int m_truckCurrentOmpreng = 600;    // Jumlah ompreng di mobil saat ini
+    int m_totalOmprengNeeded = 1270;    // Total ompreng yang dibutuhkan 7 sekolah
+    int m_totalOmprengDelivered = 0;    // Total ompreng yang berhasil diantarkan
+    int m_currentTripIndex = 0;         // Index trip aktif (0 = Trip 1, 1 = Trip 2, dst)
+    int m_totalTrips = 3;               // Total trip/batch pengiriman
+    bool m_isReloading = false;         // Sedang memuat ulang ompreng di SPPG
+    float m_reloadTimer = 0.0f;
     int m_numSchools = DEFAULT_NUM_SCHOOLS; // <<-- UBAH VARIABEL INI (misal: 3, 4, 5)
 
     // MBG Routing Algorithm Configuration

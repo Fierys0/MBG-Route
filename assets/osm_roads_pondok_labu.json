@@ -6,74 +6,74 @@
   },
   "schools": [
     {
-      "name": "SDN Pondok Labu 01 Pagi",
-      "u": 0.3541307259268554,
-      "v": 0.3834832185621053
+      "name": "SDN 01 Pangkalan Jati",
+      "u": 0.4303466666666888,
+      "v": 0.9881708004741085,
+      "demand": 220
     },
     {
-      "name": "SMPN 85 Jakarta (Pondok Labu)",
-      "u": 0.40634714074015693,
-      "v": 0.618836085905059
+      "name": "SDN 02 Pangkalan Jati",
+      "u": 0.2998814814806489,
+      "v": 0.818750492107938,
+      "demand": 200
     },
     {
-      "name": "SMAN 34 Jakarta",
-      "u": 0.4092295111101218,
-      "v": 0.6527197649284062
+      "name": "Radatul Janah",
+      "u": 0.5122666666660128,
+      "v": 0.39291560375204426,
+      "demand": 180
     },
     {
-      "name": "SMA Al-Izhar Pondok Labu",
-      "u": 0.2980003555542983,
-      "v": 0.5207110560713772
+      "name": "TK/MTs/SMK Syalafiah",
+      "u": 0.33022222222280107,
+      "v": 0.7271724513502704,
+      "demand": 230
     },
     {
-      "name": "Sekolah Charitas Pondok Labu",
-      "u": 0.5089291851848733,
-      "v": 0.25138443142532196
+      "name": "MI Darul Hikmah",
+      "u": 0.3818014814811856,
+      "v": 0.5760694574346417,
+      "demand": 190
     },
     {
-      "name": "SDN Pondok Labu 11 Pagi",
-      "u": 0.6223428740740928,
-      "v": 0.6757057477207127
+      "name": "TK Islam Nurul Quran",
+      "u": 0.3150518518523313,
+      "v": 0.8828553311814176,
+      "demand": 140
     },
     {
-      "name": "SMAN 66 Jakarta (Pondok Labu)",
-      "u": 0.7004096000006635,
-      "v": 0.36553422408906044
+      "name": "SLB Manunggal Jati",
+      "u": 0.2483022222222644,
+      "v": 0.34712736119945475,
+      "demand": 110
+    }
+  ],
+  "vehicle_capacity": 600,
+  "trips": [
+    {
+      "trip": 1,
+      "schools": [
+        "SDN 01 Pangkalan Jati",
+        "SDN 02 Pangkalan Jati",
+        "TK Islam Nurul Quran"
+      ],
+      "total_ompreng": 560
     },
     {
-      "name": "SDN Pondok Labu 02 Pagi",
-      "u": 0.5026486518521173,
-      "v": 0.34497531597298803
+      "trip": 2,
+      "schools": [
+        "TK/MTs/SMK Syalafiah",
+        "MI Darul Hikmah",
+        "SLB Manunggal Jati"
+      ],
+      "total_ompreng": 530
     },
     {
-      "name": "Komplek SDN Pondok Labu 04/09/10",
-      "u": 0.3925117629635982,
-      "v": 0.5522135879054986
-    },
-    {
-      "name": "SMP Negeri 96 Jakarta",
-      "u": 0.6205831111110456,
-      "v": 0.6941128655453213
-    },
-    {
-      "name": "SMK Negeri 41 Jakarta",
-      "u": 0.6206437925926972,
-      "v": 0.7162746880549093
-    },
-    {
-      "name": "SMP Darussalam H. Ipin",
-      "u": 0.3402346666662197,
-      "v": 0.5589903008021793
-    },
-    {
-      "name": "Al Jabr Islamic School",
-      "u": 0.6929457777781257,
-      "v": 0.4288136476843647
-    },
-    {
-      "name": "SDN Pondok Labu 12 Pagi",
-      "u": 0.7025334518524081,
-      "v": 0.7015764522184327
+      "trip": 3,
+      "schools": [
+        "Radatul Janah"
+      ],
+      "total_ompreng": 180
     }
   ]
 }

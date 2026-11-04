@@ -7,7 +7,7 @@
 #include <string>
 
 constexpr int INF = std::numeric_limits<int>::max();
-constexpr int MAX_SCHOOLS = 5;
+constexpr int MAX_SCHOOLS = 10;
 constexpr int MAX_TIME = 240;
 
 struct TimeWindow {
